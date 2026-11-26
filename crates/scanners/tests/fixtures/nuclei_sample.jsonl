@@ -1,0 +1,5 @@
+{"template-id":"apache-detect","info":{"name":"Apache Detect","severity":"info","description":"Apache web server detected"},"type":"http","host":"192.168.1.10","matched-at":"http://192.168.1.10:80/","extracted-results":["Apache/2.4.49 (Unix)"],"ip":"192.168.1.10"}
+{"template-id":"CVE-2021-41773","info":{"name":"Apache 2.4.49 - Path Traversal","severity":"high","classification":{"cve-id":["CVE-2021-41773","cve-2021-42013"],"cvss-score":7.5}},"type":"http","host":"http://192.168.1.10","matched-at":"http://192.168.1.10:8080/cgi-bin/.%2e/.%2e/etc/passwd","ip":"192.168.1.10"}
+{"template-id":"missing-x-frame-options","info":{"name":"Missing X-Frame-Options","severity":"low","classification":{"cve-id":null}},"type":"http","host":"https://srv.lab.local","matched-at":"https://srv.lab.local/","ip":"192.168.1.10","extracted-results":["<b>x</b>"]}
+{"template-id":"odd","info":{"name":"Odd","severity":"unknown"},"host":"192.168.1.10:2222","matched-at":"192.168.1.10:2222","type":"tcp"}
+this line is not json
