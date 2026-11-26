@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# install.sh - install everything vuln-scanner needs (Rust toolchain, nmap, nuclei + templates).
+# install.sh - install everything vuln-scanner needs, then start the portal.
+#
+# Default (no options): install Rust, nmap, nuclei + templates WITHOUT asking,
+# put the tools on PATH (this session and ~/.bashrc / ~/.zshrc), build, and run the server.
 #
 # Usage: ./install.sh [options]
+#   --scope VALUE    SCOPE for the server: "any", or e.g. "127.0.0.0/8,192.168.1.0/24"
+#                    (default: $SCOPE if set, otherwise the server's loopback-only default)
+#   --no-run         install only, do not start the portal
+#   --ask            ask for confirmation before each install step
 #   --check          only report what is installed / missing, change nothing
 #   --dry-run        print what would be done, change nothing
-#   -y, --yes        do not ask for confirmation
 #   --prefix DIR     where to put downloaded binaries (default: ~/.local/bin)
 #   --no-rust        skip the Rust toolchain
 #   --no-nmap        skip nmap
 #   --no-nuclei      skip nuclei and its templates
-#   --build          run `cargo build --release` at the end
+#   -y, --yes        accepted for compatibility (already the default)
 #   -h, --help       show this help
 #
 # System packages (nmap, curl, a C compiler, ...) are installed with your package manager via sudo.
@@ -19,7 +25,8 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 PREFIX="${HOME}/.local/bin"
-CHECK=0 DRY=0 YES=0 DO_RUST=1 DO_NMAP=1 DO_NUCLEI=1 DO_BUILD=0
+CHECK=0 DRY=0 YES=1 DO_RUST=1 DO_NMAP=1 DO_NUCLEI=1 DO_RUN=1
+SCOPE_ARG="${SCOPE:-}"
 NUCLEI_REPO="projectdiscovery/nuclei"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -31,18 +38,20 @@ warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*" >&2; }
 bad()  { printf '  %s✘%s %s\n' "$R" "$N" "$*"; }
 die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
 
-usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --check) CHECK=1 ;;
     --dry-run) DRY=1 ;;
     -y|--yes) YES=1 ;;
+    --ask) YES=0 ;;
+    --no-run) DO_RUN=0 ;;
+    --scope) [ $# -ge 2 ] || die "--scope needs a value"; SCOPE_ARG="$2"; shift ;;
     --prefix) [ $# -ge 2 ] || die "--prefix needs a directory"; PREFIX="$2"; shift ;;
     --no-rust) DO_RUST=0 ;;
     --no-nmap) DO_NMAP=0 ;;
     --no-nuclei) DO_NUCLEI=0 ;;
-    --build) DO_BUILD=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
@@ -77,7 +86,8 @@ fi
 
 have() { command -v "$1" >/dev/null 2>&1; }
 # `cargo` may live in ~/.cargo/bin without being on PATH yet.
-[ -f "${HOME}/.cargo/env" ] && . "${HOME}/.cargo/env" || true
+CARGO_ENV="${CARGO_HOME:-${HOME}/.cargo}/env"
+[ -f "$CARGO_ENV" ] && . "$CARGO_ENV" || true
 export PATH="${PREFIX}:${PATH}"
 
 run() {
@@ -168,7 +178,8 @@ install_rust() {
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$tmp"
   sh "$tmp" -y --profile minimal -c clippy
   rm -f "$tmp"
-  . "${HOME}/.cargo/env"
+  CARGO_ENV="${CARGO_HOME:-${HOME}/.cargo}/env"
+  . "$CARGO_ENV"
   ok "Rust installed: $(cargo --version)"
 }
 
@@ -225,19 +236,53 @@ install_base
 [ "$DO_NMAP" -eq 1 ] && install_nmap
 [ "$DO_NUCLEI" -eq 1 ] && install_nuclei
 
-if [ "$DO_BUILD" -eq 1 ]; then
-  info "Building vuln-scanner (release)"
-  have cargo || [ "$DRY" -eq 1 ] || die "cargo not found"
-  (cd "$PROJECT_DIR" && run cargo build --release)
+# Make the tools available to this script, to the server we are about to start, and to future shells.
+export PATH="${PREFIX}:${HOME}/.cargo/bin:${PATH}"
+
+persist_path() {
+  local rc="${HOME}/.bashrc"
+  case "${SHELL:-}" in *zsh) rc="${HOME}/.zshrc" ;; esac
+  local marker="# added by vuln-scanner install.sh"
+  if [ -f "$rc" ] && grep -qF "$marker" "$rc"; then
+    ok "PATH already configured in $rc"
+    return
+  fi
+  if [ "$DRY" -eq 1 ]; then echo "  [dry-run] append PATH export to $rc"; return; fi
+  printf '\n%s\nexport PATH="%s:$HOME/.cargo/bin:$PATH"\n' "$marker" "$PREFIX" >> "$rc"
+  ok "PATH added to $rc (open a new terminal, or run: source $rc)"
+}
+
+echo
+info "Configuring PATH"
+persist_path
+
+if [ "$DRY" -eq 1 ]; then
+  info "Would build and start the portal (cargo run --release -p vs-server)"
+  exit 0
 fi
 
 echo
-if [ "$DRY" -eq 0 ]; then
-  print_status || warn "some components are still missing (see above)"
+STATUS_OK=0
+print_status || STATUS_OK=1
+
+if [ "$DO_RUN" -eq 0 ]; then
   echo
-  echo "Add to your shell profile if needed:"
-  echo "  export PATH=\"${PREFIX}:\$HOME/.cargo/bin:\$PATH\""
-  echo
-  echo "Run the scanner:  cd ${PROJECT_DIR} && cargo run --release -p vs-server   (http://127.0.0.1:8080)"
-  echo "Scan targets outside loopback only after adding them to SCOPE, e.g. SCOPE=\"127.0.0.0/8,192.168.56.0/24\""
+  echo "Run later with:  cd ${PROJECT_DIR} && cargo run --release -p vs-server"
+  exit "$STATUS_OK"
 fi
+if [ "$STATUS_OK" -ne 0 ]; then
+  warn "some components are missing (see above); not starting the portal"
+  exit 1
+fi
+
+echo
+info "Building and starting the portal"
+cd "$PROJECT_DIR"
+if [ -n "$SCOPE_ARG" ]; then
+  export SCOPE="$SCOPE_ARG"
+  info "scope: $SCOPE"
+else
+  warn "scope: loopback only (default). To scan other targets: ./install.sh --scope any   (or SCOPE=\"192.168.1.0/24\")"
+fi
+echo "  Portal: http://${BIND:-127.0.0.1:8080}   (Ctrl+C to stop)"
+exec cargo run --release -p vs-server
