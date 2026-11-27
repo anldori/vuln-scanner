@@ -102,16 +102,43 @@ impl Drop for SshCreds {
     }
 }
 
+/// Sink for human-readable progress lines shown live in the web UI. Messages must never
+/// contain secrets.
+#[derive(Clone)]
+pub struct Progress(std::sync::Arc<dyn Fn(&str) + Send + Sync>);
+
+impl Progress {
+    pub fn new(f: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for Progress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Progress")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
     pub timeout_secs: u64,
     /// Present only for deep scans.
     pub ssh: Option<SshCreds>,
+    pub progress: Option<Progress>,
 }
 
 impl Default for ScanOptions {
     fn default() -> Self {
-        Self { timeout_secs: 900, ssh: None }
+        Self { timeout_secs: 900, ssh: None, progress: None }
+    }
+}
+
+impl ScanOptions {
+    /// Report a progress line (no-op when nobody listens).
+    pub fn log(&self, msg: &str) {
+        if let Some(p) = &self.progress {
+            (p.0)(msg);
+        }
     }
 }
 
@@ -158,7 +185,7 @@ mod tests {
     #[test]
     fn debug_never_prints_secrets() {
         for c in [SshCreds::key("u", 22, KEY, Some("hunter2")).unwrap(), SshCreds::password("u", 22, "hunter2").unwrap()] {
-            let s = format!("{:?} {:?}", c, ScanOptions { timeout_secs: 1, ssh: Some(c.clone()) });
+            let s = format!("{:?} {:?}", c, ScanOptions { timeout_secs: 1, ssh: Some(c.clone()), progress: None });
             assert!(!s.contains("AAAA") && !s.contains("hunter2") && s.contains("redacted"), "{s}");
         }
     }

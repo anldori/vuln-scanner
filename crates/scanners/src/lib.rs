@@ -7,7 +7,7 @@ pub mod portscan;
 pub mod rustscan;
 pub mod vuls;
 
-pub use exec::is_available;
+pub use exec::{is_available, with_ticker};
 pub use nmap::Nmap;
 pub use nuclei::Nuclei;
 pub use portscan::PortScan;

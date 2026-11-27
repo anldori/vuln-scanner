@@ -5,5 +5,5 @@ pub mod scanner;
 pub mod target;
 
 pub use model::{compute_priority, CveInfo, Finding, Scan, ScanStatus, Severity};
-pub use scanner::{ScanOptions, Scanner, SshAuth, SshCreds};
+pub use scanner::{Progress, ScanOptions, Scanner, SshAuth, SshCreds};
 pub use target::{Scope, Target, TargetError};

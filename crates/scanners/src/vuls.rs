@@ -5,7 +5,7 @@
 //! when the scan ends, including on timeout or error (the dir is owned by the running future).
 //! Nothing secret ever appears in argv.
 
-use crate::exec::{run_capture, run_capture_env, which};
+use crate::exec::{run_capture, run_capture_env, which, with_ticker};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use vs_core::{Finding, ScanOptions, Scanner, Severity, SshAuth, SshCreds, Target};
 
 /// Name of the single server entry in the generated config; also the results file name.
@@ -188,6 +189,7 @@ impl Vuls {
             auth_opts.push_str("  BatchMode yes\n");
         }
 
+        opts.log(&format!("vuls: preparing SSH login for {}@{host}:{} ({})", creds.user, creds.port, creds.method()));
         if key_pem.is_some() {
             // Fail early and clearly on a broken key or a missing/wrong passphrase.
             let key_s = key.to_str().context("temp path")?.to_string();
@@ -205,6 +207,7 @@ impl Vuls {
             })?;
         }
 
+        opts.log("vuls: fetching the SSH host key");
         // Pin the host key for this scan only (trust-on-first-use against the scoped target).
         let scan = run_capture(
             "ssh-keyscan",
@@ -229,21 +232,42 @@ impl Vuls {
                 format!("-log-dir={}", logs.display()),
             ]
         };
+        opts.log("vuls: logging in over SSH and collecting installed packages");
         let mut scan_args = common("scan");
         scan_args.extend([format!("-cachedb-path={}", cache.display()), "-quiet".into(), SERVER.into()]);
-        run_capture_env(&self.binary, &scan_args, opts.timeout_secs, &env).await.context(
+        with_ticker(
+            Duration::from_secs(10),
+            run_capture_env(&self.binary, &scan_args, opts.timeout_secs, &env),
+            |el| opts.log(&format!("vuls: scan still running ({}s)", el.as_secs())),
+        )
+        .await
+        .context(
             "vuls scan failed (check the SSH user, password/key and that the account can log in over SSH)",
         )?;
 
+        opts.log("vuls: matching packages against the vulnerability DB (the first run downloads ~15 GB)");
         let mut report_args = common("report");
         report_args.extend(
             ["-format-json", "-to-localfile", "-no-progress", "-quiet", "-trivy-skip-db-update", "-trivy-skip-java-db-update"]
                 .map(String::from),
         );
-        run_capture_env(&self.binary, &report_args, self.report_timeout_secs, &env).await.context("vuls report")?;
+        let db = self.db_path.clone();
+        with_ticker(
+            Duration::from_secs(10),
+            run_capture_env(&self.binary, &report_args, self.report_timeout_secs, &env),
+            |el| {
+                let size = std::fs::metadata(&db).map(|m| format!(", DB file {:.1} GB", m.len() as f64 / 1e9)).unwrap_or_default();
+                opts.log(&format!("vuls: report still running ({}s{size})", el.as_secs()));
+            },
+        )
+        .await
+        .context("vuls report")?;
 
+        opts.log("vuls: reading results");
         let json = read_result(&results)?;
-        parse_report(&json, &host)
+        let findings = parse_report(&json, &host)?;
+        opts.log(&format!("vuls: {} CVE(s) detected", findings.len()));
+        Ok(findings)
     }
 }
 

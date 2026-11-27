@@ -4,9 +4,26 @@ use anyhow::{bail, Result};
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
-use vs_core::{CveInfo, Finding, Scan, ScanOptions, Scanner, Scope, Target};
-use vs_scanners::Vuls;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use vs_core::{CveInfo, Finding, Progress, Scan, ScanOptions, Scanner, Scope, Target};
+use vs_scanners::{with_ticker, Vuls};
 use vs_enrich::Enricher;
+
+/// Progress log of one scan: lines are queued here and written to `scan_events` by a task.
+#[derive(Clone)]
+struct Events(UnboundedSender<(&'static str, String)>);
+
+impl Events {
+    fn info(&self, m: impl Into<String>) {
+        let _ = self.0.send(("info", m.into()));
+    }
+    fn warn(&self, m: impl Into<String>) {
+        let _ = self.0.send(("warn", m.into()));
+    }
+    fn error(&self, m: impl Into<String>) {
+        let _ = self.0.send(("error", m.into()));
+    }
+}
 
 pub struct Worker {
     pub pool: SqlitePool,
@@ -58,6 +75,25 @@ impl Worker {
     }
 
     async fn run_one(&self, scan: &Scan) -> Result<(usize, Option<String>)> {
+        let (tx, mut rx) = unbounded_channel::<(&'static str, String)>();
+        let (pool, sid) = (self.pool.clone(), scan.id.clone());
+        let writer = tokio::spawn(async move {
+            while let Some((level, msg)) = rx.recv().await {
+                db::add_event(&pool, &sid, level, &msg).await;
+            }
+        });
+        let ev = Events(tx);
+        let res = self.run_inner(scan, &ev).await;
+        match &res {
+            Ok((n, _)) => ev.info(format!("Scan finished: {n} finding(s)")),
+            Err(e) => ev.error(format!("Scan failed: {e:#}")),
+        }
+        drop(ev);
+        let _ = writer.await; // flush every queued line before the scan is reported finished
+        res
+    }
+
+    async fn run_inner(&self, scan: &Scan, ev: &Events) -> Result<(usize, Option<String>)> {
         let id = scan.id.as_str();
         // Take the secret out of the store first so it is gone on every path (error, scope reject...).
         let ssh = if scan.deep { self.creds.take(id) } else { None };
@@ -65,22 +101,37 @@ impl Worker {
         let target = Target::parse(&scan.target)?;
         self.scope.check(&target)?;
 
-        let opts = ScanOptions::default();
+        let progress = {
+            let ev = ev.clone();
+            Progress::new(move |m| ev.info(m))
+        };
+        let opts = ScanOptions { progress: Some(progress), ..ScanOptions::default() };
+        ev.info(format!("Scan started: {}{}", scan.target, if scan.deep { " (deep scan)" } else { "" }));
         let mut notes: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
         let mut findings: Vec<Finding> = Vec::new();
         let mut succeeded = 0;
 
         for sc in &self.scanners {
-            match sc.run(&target, &opts).await {
+            let name = sc.name();
+            ev.info(format!("{name}: started"));
+            let t0 = std::time::Instant::now();
+            // Heartbeat so a long scanner never looks stuck.
+            let res = with_ticker(Duration::from_secs(20), sc.run(&target, &opts), |el| {
+                ev.info(format!("{name}: still running ({}s)", el.as_secs()))
+            })
+            .await;
+            match res {
                 Ok(f) => {
-                    tracing::info!(%id, scanner = sc.name(), findings = f.len(), "scanner finished");
+                    tracing::info!(%id, scanner = name, findings = f.len(), "scanner finished");
+                    ev.info(format!("{name}: finished, {} finding(s) in {}s", f.len(), t0.elapsed().as_secs()));
                     succeeded += 1;
                     findings.extend(f);
                 }
                 Err(e) => {
-                    tracing::warn!(%id, scanner = sc.name(), "scanner failed: {e:#}");
-                    errors.push(format!("{}: {e:#}", sc.name()));
+                    tracing::warn!(%id, scanner = name, "scanner failed: {e:#}");
+                    ev.warn(format!("{name}: failed: {e:#}"));
+                    errors.push(format!("{name}: {e:#}"));
                 }
             }
         }
@@ -91,18 +142,21 @@ impl Worker {
                 (None, _) => Err(anyhow::anyhow!("Vuls is not available on this server")),
                 (_, None) => Err(anyhow::anyhow!("SSH credentials are no longer available (server restarted?); submit the scan again")),
                 (Some(v), Some(creds)) => {
+                    ev.info("vuls: deep scan started");
                     let deep_opts = ScanOptions { ssh: Some(creds), ..opts.clone() };
-                    v.run(&target, &deep_opts).await
+                    v.run(&target, &deep_opts).await // Vuls reports its own progress and heartbeats
                 }
             };
             match res {
                 Ok(f) => {
                     tracing::info!(%id, scanner = "vuls", findings = f.len(), "scanner finished");
+                    ev.info(format!("vuls: finished, {} finding(s)", f.len()));
                     succeeded += 1;
                     findings.extend(f);
                 }
                 Err(e) => {
                     tracing::warn!(%id, scanner = "vuls", "scanner failed: {e:#}");
+                    ev.warn(format!("vuls (deep scan): failed: {e:#}"));
                     errors.push(format!("vuls (deep scan): {e:#}"));
                 }
             }
@@ -116,13 +170,21 @@ impl Worker {
         findings.retain(|f| seen.insert(f.fingerprint.clone()));
 
         if let Some(en) = &self.enricher {
-            notes.extend(self.enrich(en, &mut findings).await);
+            let n_cve = findings.iter().flat_map(|f| f.cve.iter()).collect::<HashSet<_>>().len();
+            ev.info(format!("Enriching {n_cve} CVE(s) (EPSS / KEV / NVD)..."));
+            let w = with_ticker(Duration::from_secs(20), self.enrich(en, &mut findings), |el| {
+                ev.info(format!("Enrichment still running ({}s)", el.as_secs()))
+            })
+            .await;
+            w.iter().for_each(|m| ev.warn(format!("enrichment: {m}")));
+            notes.extend(w);
         } else {
             // Still give every finding a baseline priority from its severity/CVSS.
             findings.iter_mut().for_each(|f| f.apply_enrichment(&HashMap::new()));
         }
 
         let n = findings.len();
+        ev.info(format!("Saving {n} finding(s)"));
         let notes = if notes.is_empty() { None } else { Some(notes.join(" | ")) };
         db::finish_scan(&self.pool, id, &findings, notes.as_deref()).await?;
         Ok((n, notes))

@@ -51,3 +51,13 @@ CREATE TABLE IF NOT EXISTS cve_cache (
     kev        INTEGER NOT NULL DEFAULT 0,
     fetched_at TEXT NOT NULL
 );
+
+-- Live progress log of a scan (shown in the web UI). Never contains secrets.
+CREATE TABLE IF NOT EXISTS scan_events (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_id TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+    ts      TEXT NOT NULL,
+    level   TEXT NOT NULL,
+    message TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scan_events ON scan_events(scan_id, id);

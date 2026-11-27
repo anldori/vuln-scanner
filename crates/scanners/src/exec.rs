@@ -62,3 +62,17 @@ pub fn is_available(binary: &str) -> bool {
 pub fn which(binary: &str) -> Option<std::path::PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(binary)).find(|p| p.is_file())
 }
+
+/// Await `fut`, calling `on_tick(elapsed)` every `every` while it is still running (progress heartbeat).
+pub async fn with_ticker<T>(every: Duration, fut: impl std::future::Future<Output = T>, mut on_tick: impl FnMut(Duration)) -> T {
+    tokio::pin!(fut);
+    let start = std::time::Instant::now();
+    let mut iv = tokio::time::interval(every);
+    iv.tick().await; // the first tick fires immediately
+    loop {
+        tokio::select! {
+            r = &mut fut => return r,
+            _ = iv.tick() => on_tick(start.elapsed()),
+        }
+    }
+}

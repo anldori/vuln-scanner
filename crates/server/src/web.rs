@@ -1,6 +1,6 @@
 use crate::creds::CredStore;
 use crate::db;
-use axum::extract::{Form, Path, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -27,6 +27,7 @@ pub fn router(state: AppState) -> Router {
         .route("/scans/{id}/report/{fmt}", get(report))
         .route("/api/scans", get(api_list))
         .route("/api/scans/{id}", get(api_get))
+        .route("/api/scans/{id}/events", get(api_events))
         .with_state(state)
 }
 
@@ -245,7 +246,8 @@ async fn scan_page(State(st): State<AppState>, Path(id): Path<String>) -> Result
     let scan = load(&st, &id).await?;
     let findings = db::get_findings(&st.pool, &id).await?;
     let active = matches!(scan.status, ScanStatus::Queued | ScanStatus::Running);
-    let head = if active { "<meta http-equiv=\"refresh\" content=\"3\">" } else { "" };
+    // Live log polling replaces the old full-page refresh; keep a refresh only for browsers without JS.
+    let head = if active { "<noscript><meta http-equiv=\"refresh\" content=\"5\"></noscript>" } else { "" };
     let eid = esc(&id);
 
     let mut b = format!(
@@ -266,12 +268,14 @@ async fn scan_page(State(st): State<AppState>, Path(id): Path<String>) -> Result
             },
     );
     if active {
-        b.push_str("<div class=\"notice\">Scan in progress. This page refreshes automatically.</div>");
+        b.push_str("<div class=\"notice\">Scan in progress. Live log below; the page reloads when the scan ends.</div>");
     }
     if let Some(e) = &scan.error {
         let (label, cls) = if scan.status == ScanStatus::Failed { ("Error", " err") } else { ("Notes", "") };
         b.push_str(&format!("<div class=\"notice{cls}\"><b>{label}:</b> {}</div>", esc(e)));
     }
+
+    b.push_str(&log_panel(&st, &id, active).await?);
 
     let counts = vs_report::severity_counts(&findings);
     b.push_str("<div class=\"stats\">");
@@ -309,6 +313,60 @@ async fn scan_page(State(st): State<AppState>, Path(id): Path<String>) -> Result
         b.push_str(FILTER_JS);
     }
     Ok(Html(page_with_head("Scan", head, &b)))
+}
+
+/// Progress log of a scan: rendered server-side from stored events, then polled while the scan is active.
+async fn log_panel(st: &AppState, id: &str, active: bool) -> Result<String, AppError> {
+    let events = db::get_events(&st.pool, id, 0).await?;
+    if events.is_empty() && !active {
+        return Ok(String::new());
+    }
+    let last = events.last().map(|e| e.id).unwrap_or(0);
+    let mut lines = String::new();
+    for e in &events {
+        lines.push_str(&format!(
+            "<div class=\"ev-{lvl}\"><span class=\"muted\">{t}</span> {m}</div>",
+            lvl = esc(&e.level),
+            t = esc(e.ts.get(11..19).unwrap_or("")),
+            m = esc(&e.message),
+        ));
+    }
+    let script = if active {
+        format!(
+            "<script>(function(){{var id={id_js},last={last},log=document.getElementById('log'),idle=document.getElementById('idle'),\
+             lastAt=Date.now();function add(e){{var d=document.createElement('div');d.className='ev-'+e.level;\
+             var t=document.createElement('span');t.className='muted';t.textContent=e.ts.slice(11,19)+' ';d.appendChild(t);\
+             d.appendChild(document.createTextNode(e.message));log.appendChild(d)}}\
+             function tick(){{fetch('/api/scans/'+id+'/events?after='+last,{{cache:'no-store'}}).then(function(r){{return r.json()}}).then(function(j){{\
+             var near=log.scrollHeight-log.scrollTop-log.clientHeight<40;\
+             j.events.forEach(function(e){{add(e);last=e.id;lastAt=Date.now()}});if(near)log.scrollTop=log.scrollHeight;\
+             if(j.status==='done'||j.status==='failed'){{setTimeout(function(){{location.reload()}},500);return}}\
+             setTimeout(tick,2000)}}).catch(function(){{setTimeout(tick,4000)}})}}\
+             setInterval(function(){{var s=Math.round((Date.now()-lastAt)/1000);idle.textContent='last activity '+s+'s ago';\
+             idle.className=s>90?'muted idle-warn':'muted'}},1000);log.scrollTop=log.scrollHeight;tick()}})();</script>",
+            id_js = serde_json::to_string(id).unwrap_or_else(|_| "\"\"".into()),
+        )
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "<style>#log{{max-height:260px;overflow:auto;font:.82rem/1.5 ui-monospace,monospace;padding:10px 14px}}\
+         .ev-warn{{color:#b7791f}}.ev-error{{color:#c53030}}.idle-warn{{color:#c53030;font-weight:600}}</style>\
+         <div class=\"card\" style=\"margin-bottom:14px\"><div class=\"toolbar\" style=\"padding:8px 14px 0\"><b>Progress log</b>\
+         <span class=\"grow\"></span><span class=\"muted\" id=\"idle\"></span></div><div id=\"log\">{lines}</div></div>{script}"
+    ))
+}
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    #[serde(default)]
+    after: i64,
+}
+
+async fn api_events(State(st): State<AppState>, Path(id): Path<String>, Query(q): Query<EventsQuery>) -> Result<Json<serde_json::Value>, AppError> {
+    let scan = load(&st, &id).await?;
+    let events = db::get_events(&st.pool, &id, q.after).await?;
+    Ok(Json(serde_json::json!({ "status": scan.status, "events": events })))
 }
 
 /// Click a severity card to filter rows; click again to clear. The "Hide unfixed" checkbox drops

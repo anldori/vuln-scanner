@@ -58,8 +58,10 @@ impl Scanner for RustScan {
 
     async fn run(&self, target: &Target, opts: &ScanOptions) -> Result<Vec<Finding>> {
         let started = std::time::Instant::now();
+        opts.log("rustscan: scanning ports...");
         let out = run_capture(&self.binary, &self.build_args(target), opts.timeout_secs).await?;
         let addrs = parse_greppable(&out);
+        opts.log(&format!("rustscan: {} open port(s) found; grabbing banners", addrs.len()));
         // Banner grabbing gets whatever time is left of the overall budget.
         let left = Duration::from_secs(opts.timeout_secs).saturating_sub(started.elapsed());
         let ps = PortScan::default();
