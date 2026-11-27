@@ -1,3 +1,4 @@
+use crate::creds::CredStore;
 use crate::db;
 use axum::extract::{Form, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -6,13 +7,16 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use sqlx::SqlitePool;
-use vs_core::{Scan, ScanStatus, Scope, Target};
+use vs_core::{Scan, ScanStatus, Scope, SshCreds, Target};
 use vs_report::{esc, STYLE};
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
     pub scope: Scope,
+    pub creds: CredStore,
+    /// `Some(reason)` when deep scans are unavailable.
+    pub deep_off: Option<String>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -64,7 +68,7 @@ fn page_with_head(title: &str, head: &str, body: &str) -> String {
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
          <title>{} · Vuln Scanner</title>{head}<style>{STYLE}</style></head><body>\
          <header class=\"top\"><div class=\"in\"><a class=\"brand\" href=\"/\"><span class=\"logo\"></span>Vuln Scanner</a>\
-         <span class=\"muted\">nmap · nuclei · EPSS · KEV</span></div></header>\
+         <span class=\"muted\">portscan · nuclei · EPSS · KEV</span></div></header>\
          <main class=\"wrap\">{body}</main></body></html>",
         esc(title)
     )
@@ -96,11 +100,12 @@ async fn index(State(st): State<AppState>) -> Result<Html<String>, AppError> {
     let counts = db::severity_counts(&st.pool).await?;
     let mut b = format!(
         "<h1>New scan</h1><p class=\"sub\">Scan a host, IP or CIDR. Scope: <code>{scope}</code></p>\
-         <form class=\"card pad\" method=\"post\" action=\"/scans\"><div class=\"hero\">\
+         <form class=\"card pad\" method=\"post\" action=\"/scans\" autocomplete=\"off\"><div class=\"hero\">\
          <input name=\"target\" required autofocus autocomplete=\"off\" placeholder=\"127.0.0.1  ·  192.168.1.0/24  ·  host.lab\" aria-label=\"Target\">\
-         <button class=\"btn\">Start scan</button></div></form>\
+         <button class=\"btn\">Start scan</button></div>{deep}</form>\
          <h2>Recent scans</h2>",
         scope = esc(&st.scope.describe()),
+        deep = deep_form(&st),
     );
     if scans.is_empty() {
         b.push_str("<div class=\"card empty\">No scans yet. Start one above.</div>");
@@ -109,10 +114,11 @@ async fn index(State(st): State<AppState>) -> Result<Html<String>, AppError> {
         for s in &scans {
             let c = counts.get(&s.id).copied().unwrap_or_default();
             b.push_str(&format!(
-                "<tr><td><a class=\"mono\" href=\"/scans/{id}\">{target}</a></td><td>{status}</td><td>{chips}</td>\
+                "<tr><td><a class=\"mono\" href=\"/scans/{id}\">{target}</a>{deep}</td><td>{status}</td><td>{chips}</td>\
                  <td class=\"muted\">{when}</td><td><a href=\"/scans/{id}\">Open &rarr;</a></td></tr>",
                 id = esc(&s.id),
                 target = esc(&s.target),
+                deep = if s.deep { " <span class=\"muted\">· deep</span>" } else { "" },
                 status = vs_report::status_pill(status_label(s.status)),
                 chips = count_chips(&c),
                 when = s.created_at.format("%Y-%m-%d %H:%M"),
@@ -126,6 +132,48 @@ async fn index(State(st): State<AppState>) -> Result<Html<String>, AppError> {
 #[derive(Deserialize)]
 struct NewScan {
     target: String,
+    /// Checkbox: present ("on") when deep scan is requested.
+    #[serde(default)]
+    deep: Option<String>,
+    #[serde(default)]
+    ssh_user: String,
+    #[serde(default)]
+    ssh_port: String,
+    /// `key` (default) or `password`.
+    #[serde(default)]
+    ssh_auth: String,
+    #[serde(default)]
+    ssh_password: String,
+    #[serde(default)]
+    ssh_key: String,
+    #[serde(default)]
+    ssh_passphrase: String,
+}
+
+/// Deep-scan part of the new-scan form. Secrets are never rendered back.
+fn deep_form(st: &AppState) -> String {
+    let (disabled, note) = match &st.deep_off {
+        Some(reason) => (" disabled", format!("<div class=\"muted\" style=\"margin-top:8px\">{}</div>", esc(reason))),
+        None => ("", String::new()),
+    };
+    format!(
+        "<div style=\"margin-top:14px\"><label><input type=\"checkbox\" name=\"deep\" id=\"deep\"{disabled}> \
+         <b>Deep scan with Vuls</b> <span class=\"muted\">(log in over SSH and check installed packages for CVEs)</span></label>{note}\
+         <div id=\"deepbox\" hidden style=\"margin-top:10px;display:grid;gap:8px;max-width:640px\">\
+         <div style=\"display:flex;gap:8px\">\
+         <input name=\"ssh_user\" placeholder=\"SSH user\" autocomplete=\"off\" maxlength=\"32\" aria-label=\"SSH user\" style=\"flex:2\">\
+         <input name=\"ssh_port\" placeholder=\"Port (22)\" inputmode=\"numeric\" autocomplete=\"off\" maxlength=\"5\" aria-label=\"SSH port\" style=\"flex:1\">\
+         <select name=\"ssh_auth\" id=\"sshauth\" aria-label=\"Authentication\" style=\"flex:2\"><option value=\"key\">Private key</option><option value=\"password\">Password</option></select></div>\
+         <div id=\"authkey\" style=\"display:grid;gap:8px\">\
+         <textarea name=\"ssh_key\" rows=\"6\" spellcheck=\"false\" autocomplete=\"off\" maxlength=\"16384\" \
+         placeholder=\"-----BEGIN OPENSSH PRIVATE KEY-----&#10;...\" aria-label=\"SSH private key\" style=\"font-family:monospace\"></textarea>\
+         <input type=\"password\" name=\"ssh_passphrase\" placeholder=\"Key passphrase (only if the key is encrypted)\" autocomplete=\"new-password\" maxlength=\"256\" aria-label=\"Key passphrase\"></div>\
+         <div id=\"authpw\" hidden><input type=\"password\" name=\"ssh_password\" placeholder=\"SSH password\" autocomplete=\"new-password\" maxlength=\"256\" aria-label=\"SSH password\" style=\"width:100%\"></div>\
+         <div class=\"muted\">Secrets are kept in memory only for this scan, never stored or logged. The first deep scan on a new machine downloads the Vuls vulnerability DB (~15 GB).</div></div></div>\
+         <script>(function(){{var c=document.getElementById('deep'),b=document.getElementById('deepbox');\
+         var m=document.getElementById('sshauth'),k=document.getElementById('authkey'),w=document.getElementById('authpw');\
+         function f(){{b.hidden=!c.checked;var p=m.value==='password';k.hidden=p;w.hidden=!p}}c.addEventListener('change',f);m.addEventListener('change',f);f()}})();</script>"
+    )
 }
 
 /// Reject cross-site form posts: a browser-sent Origin must match the Host we were addressed as.
@@ -154,8 +202,38 @@ async fn create_scan(State(st): State<AppState>, headers: HeaderMap, Form(f): Fo
         )));
     }
     let id = uuid::Uuid::new_v4().to_string();
-    db::create_scan(&st.pool, &id, &target.as_arg()).await?;
-    db::audit(&st.pool, "scan_queued", &format!("{id} {}", target.as_arg())).await;
+    if f.deep.is_none() {
+        db::create_scan(&st.pool, &id, &target.as_arg(), None).await?;
+        db::audit(&st.pool, "scan_queued", &format!("{id} {}", target.as_arg())).await;
+        return Ok(Redirect::to(&format!("/scans/{id}")));
+    }
+
+    // ---- deep scan ----
+    if let Some(reason) = &st.deep_off {
+        return Err(AppError::bad_request(reason));
+    }
+    if matches!(target, Target::Cidr(_)) {
+        return Err(AppError::bad_request("Deep scan works on a single host or IP, not a CIDR range."));
+    }
+    let port = match f.ssh_port.trim() {
+        "" => 22,
+        p => p.parse::<u16>().map_err(|_| AppError::bad_request("invalid SSH port"))?,
+    };
+    // Error messages never echo the submitted values.
+    let creds = match f.ssh_auth.as_str() {
+        "password" => SshCreds::password(&f.ssh_user, port, &f.ssh_password),
+        "" | "key" => SshCreds::key(&f.ssh_user, port, &f.ssh_key, Some(f.ssh_passphrase.as_str())),
+        _ => Err("unknown authentication method".into()),
+    }
+    .map_err(AppError::bad_request)?;
+    let (user, port, method) = (creds.user.clone(), creds.port, creds.method());
+    // Store the secret BEFORE the scan becomes claimable, and discard it if queueing fails.
+    st.creds.put(&id, creds);
+    if let Err(e) = db::create_scan(&st.pool, &id, &target.as_arg(), Some(db::DeepInfo { user: &user, port, auth: method })).await {
+        st.creds.take(&id);
+        return Err(e.into());
+    }
+    db::audit(&st.pool, "scan_queued", &format!("{id} {} deep user={user} port={port} auth={method}", target.as_arg())).await;
     Ok(Redirect::to(&format!("/scans/{id}")))
 }
 
@@ -176,7 +254,16 @@ async fn scan_page(State(st): State<AppState>, Path(id): Path<String>) -> Result
         esc(&scan.target),
         vs_report::status_pill(status_label(scan.status)),
         scan.created_at.format("%Y-%m-%d %H:%M:%S"),
-        scan.finished_at.map(|t| format!(" · finished {}", t.format("%H:%M:%S"))).unwrap_or_default(),
+        scan.finished_at.map(|t| format!(" · finished {}", t.format("%H:%M:%S"))).unwrap_or_default()
+            + &match (scan.deep, &scan.ssh_user) {
+                (true, Some(u)) => format!(
+                    " · deep scan as {}:{} ({})",
+                    esc(u),
+                    scan.ssh_port.unwrap_or(22),
+                    esc(scan.ssh_auth.as_deref().unwrap_or("key"))
+                ),
+                _ => String::new(),
+            },
     );
     if active {
         b.push_str("<div class=\"notice\">Scan in progress. This page refreshes automatically.</div>");
@@ -192,6 +279,15 @@ async fn scan_page(State(st): State<AppState>, Path(id): Path<String>) -> Result
         b.push_str(&format!("<button type=\"button\" class=\"stat {0}\" data-f=\"{0}\"><b>{1}</b><span>{0}</span></button>", s.as_str(), n));
     }
     b.push_str("</div><div class=\"toolbar\"><span class=\"muted\" id=\"shown\"></span><span class=\"grow\"></span>");
+    let unfixed = findings.iter().filter(|f| f.fix_available == Some(false)).count();
+    let fixable = findings.iter().filter(|f| f.fix_available == Some(true)).count();
+    if unfixed > 0 {
+        // Pre-checked only when it leaves something to show (on fully patched hosts every CVE is "unfixed").
+        let checked = if fixable > 0 { " checked" } else { "" };
+        b.push_str(&format!(
+            "<label class=\"muted\" title=\"Vulnerabilities with no vendor fix yet\"><input type=\"checkbox\" id=\"hidefix\"{checked}> Hide unfixed ({unfixed})</label>"
+        ));
+    }
     if scan.status == ScanStatus::Done {
         b.push_str(&format!(
             "<a class=\"btn ghost\" href=\"/scans/{eid}/report/html\">HTML</a>\
@@ -215,14 +311,18 @@ async fn scan_page(State(st): State<AppState>, Path(id): Path<String>) -> Result
     Ok(Html(page_with_head("Scan", head, &b)))
 }
 
-/// Click a severity card to filter rows; click again to clear.
+/// Click a severity card to filter rows; click again to clear. The "Hide unfixed" checkbox drops
+/// findings that have no vendor fix, and the cards count only what is not hidden.
 const FILTER_JS: &str = r#"<script>
 (function(){var on=null,rows=[].slice.call(document.querySelectorAll('#ft tbody tr')),
-cards=[].slice.call(document.querySelectorAll('.stat')),lab=document.getElementById('shown');
-function apply(){var n=0;rows.forEach(function(r){var s=!on||r.dataset.sev===on;r.style.display=s?'':'none';if(s)n++});
-cards.forEach(function(c){c.classList.toggle('on',c.dataset.f===on)});
-lab.textContent=n+' of '+rows.length+' findings'+(on?' ('+on+')':'')}
-cards.forEach(function(c){c.addEventListener('click',function(){on=on===c.dataset.f?null:c.dataset.f;apply()})});apply()})();
+cards=[].slice.call(document.querySelectorAll('.stat')),lab=document.getElementById('shown'),hf=document.getElementById('hidefix');
+function apply(){var n=0,tot=0,cnt={};rows.forEach(function(r){var v=!(hf&&hf.checked&&r.dataset.fix==='0');
+if(v){tot++;cnt[r.dataset.sev]=(cnt[r.dataset.sev]||0)+1}
+var s=v&&(!on||r.dataset.sev===on);r.style.display=s?'':'none';if(s)n++});
+cards.forEach(function(c){c.classList.toggle('on',c.dataset.f===on);c.querySelector('b').textContent=cnt[c.dataset.f]||0});
+lab.textContent=n+' of '+tot+' findings'+(on?' ('+on+')':'')+(tot<rows.length?' · '+(rows.length-tot)+' unfixed hidden':'')}
+cards.forEach(function(c){c.addEventListener('click',function(){on=on===c.dataset.f?null:c.dataset.f;apply()})});
+if(hf)hf.addEventListener('change',apply);apply()})();
 </script>"#;
 
 async fn report(State(st): State<AppState>, Path((id, fmt)): Path<(String, String)>) -> Result<Response, AppError> {

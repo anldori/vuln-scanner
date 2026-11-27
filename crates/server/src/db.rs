@@ -29,6 +29,10 @@ fn row_to_scan(r: &sqlx::sqlite::SqliteRow) -> Scan {
         created_at: parse_ts(&r.get::<String, _>("created_at")),
         finished_at: r.get::<Option<String>, _>("finished_at").map(|s| parse_ts(&s)),
         error: r.get("error"),
+        deep: r.get::<i64, _>("deep") != 0,
+        ssh_user: r.get("ssh_user"),
+        ssh_port: r.get::<Option<i64>, _>("ssh_port").and_then(|p| u16::try_from(p).ok()),
+        ssh_auth: r.get("ssh_auth"),
     }
 }
 
@@ -44,11 +48,22 @@ pub async fn audit(pool: &SqlitePool, action: &str, detail: &str) {
     }
 }
 
-pub async fn create_scan(pool: &SqlitePool, id: &str, target: &str) -> Result<()> {
-    sqlx::query("INSERT INTO scans (id, target, status, created_at) VALUES (?, ?, 'queued', ?)")
+/// Non-secret login info of a deep scan (the private key is kept in memory only).
+pub struct DeepInfo<'a> {
+    pub user: &'a str,
+    pub port: u16,
+    pub auth: &'a str,
+}
+
+pub async fn create_scan(pool: &SqlitePool, id: &str, target: &str, deep: Option<DeepInfo<'_>>) -> Result<()> {
+    sqlx::query("INSERT INTO scans (id, target, status, created_at, deep, ssh_user, ssh_port, ssh_auth) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)")
         .bind(id)
         .bind(target)
         .bind(Utc::now().to_rfc3339())
+        .bind(i64::from(deep.is_some()))
+        .bind(deep.as_ref().map(|d| d.user))
+        .bind(deep.as_ref().map(|d| i64::from(d.port)))
+        .bind(deep.as_ref().map(|d| d.auth))
         .execute(pool)
         .await?;
     Ok(())
@@ -85,20 +100,21 @@ pub async fn get_findings(pool: &SqlitePool, scan_id: &str) -> Result<Vec<Findin
             priority: r.get::<f64, _>("priority") as f32,
             evidence: r.get("evidence"),
             tool: r.get("tool"),
+            fix_available: r.get::<Option<i64>, _>("fix_available").map(|v| v != 0),
         })
         .collect())
 }
 
 /// Atomically claim the oldest queued scan.
-pub async fn claim_next(pool: &SqlitePool) -> Result<Option<(String, String)>> {
+pub async fn claim_next(pool: &SqlitePool) -> Result<Option<Scan>> {
     let row = sqlx::query(
         "UPDATE scans SET status = 'running' \
          WHERE id = (SELECT id FROM scans WHERE status = 'queued' ORDER BY created_at LIMIT 1) \
-         RETURNING id, target",
+         RETURNING *",
     )
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|r| (r.get("id"), r.get("target"))))
+    Ok(row.as_ref().map(row_to_scan))
 }
 
 /// Mark a scan done. `notes` (e.g. a scanner or enrichment warning) is kept in `error`.
@@ -107,8 +123,8 @@ pub async fn finish_scan(pool: &SqlitePool, id: &str, findings: &[Finding], note
     for f in findings {
         sqlx::query(
             "INSERT OR IGNORE INTO findings \
-             (scan_id, fingerprint, host, port, protocol, service, title, severity, cve, cvss, epss, kev, priority, evidence, tool) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (scan_id, fingerprint, host, port, protocol, service, title, severity, cve, cvss, epss, kev, priority, evidence, tool, fix_available) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(&f.fingerprint)
@@ -125,6 +141,7 @@ pub async fn finish_scan(pool: &SqlitePool, id: &str, findings: &[Finding], note
         .bind(f64::from(f.priority))
         .bind(&f.evidence)
         .bind(&f.tool)
+        .bind(f.fix_available.map(i64::from))
         .execute(&mut *tx)
         .await?;
     }
@@ -148,10 +165,14 @@ pub async fn fail_scan(pool: &SqlitePool, id: &str, error: &str) -> Result<()> {
     Ok(())
 }
 
-/// Scans left in `running` by a previous process can never complete.
+/// Scans left in `running` by a previous process can never complete; neither can queued deep
+/// scans, because their SSH credentials were held in memory only.
 pub async fn fail_interrupted(pool: &SqlitePool) -> Result<u64> {
     let r = sqlx::query(
-        "UPDATE scans SET status = 'failed', finished_at = ?, error = 'interrupted by server restart' WHERE status = 'running'",
+        "UPDATE scans SET status = 'failed', finished_at = ?, \
+         error = CASE status WHEN 'running' THEN 'interrupted by server restart' \
+                 ELSE 'server restarted before the deep scan started; SSH credentials are kept in memory only, submit it again' END \
+         WHERE status = 'running' OR (status = 'queued' AND deep = 1)",
     )
     .bind(Utc::now().to_rfc3339())
     .execute(pool)

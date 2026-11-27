@@ -1,0 +1,166 @@
+{
+ "jsonVersion": 4,
+ "serverName": "target",
+ "family": "ubuntu",
+ "release": "24.04",
+ "scannedVia": "remote",
+ "errors": [],
+ "warnings": [],
+ "scannedCves": {
+  "CVE-2023-45927": {
+   "cveID": "CVE-2023-45927",
+   "confidences": [
+    {
+     "score": 100,
+     "detectionMethod": "UbuntuAPIMatch"
+    }
+   ],
+   "affectedPackages": [
+    {
+     "name": "libslang2",
+     "fixedIn": "9.9.9-1"
+    }
+   ],
+   "cveContents": {
+    "nvd": [
+     {
+      "type": "nvd",
+      "cveID": "CVE-2023-45927",
+      "cvss2Score": 0,
+      "cvss3Score": 9.1,
+      "cvss3Severity": "CRITICAL",
+      "cvss3Vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:H"
+     }
+    ]
+   }
+  },
+  "CVE-2023-20585": {
+   "cveID": "CVE-2023-20585",
+   "confidences": [
+    {
+     "score": 100,
+     "detectionMethod": "UbuntuAPIMatch"
+    }
+   ],
+   "affectedPackages": [
+    {
+     "name": "amd64-microcode",
+     "notFixedYet": true,
+     "fixState": "needed"
+    }
+   ],
+   "cveContents": {
+    "nvd": [
+     {
+      "type": "nvd",
+      "cveID": "CVE-2023-20585",
+      "cvss2Score": 0,
+      "cvss3Score": 0,
+      "cvss3Severity": "",
+      "cvss3Vector": ""
+     }
+    ],
+    "redhat_api": [
+     {
+      "type": "redhat_api",
+      "cveID": "CVE-2023-20585",
+      "cvss2Score": 0,
+      "cvss3Score": 5.3,
+      "cvss3Severity": "Moderate",
+      "cvss3Vector": "CVSS:3.1/AV:L/AC:H/PR:H/UI:N/S:C/C:N/I:H/A:N"
+     }
+    ]
+   }
+  },
+  "CVE-2013-4739": {
+   "cveID": "CVE-2013-4739",
+   "confidences": [
+    {
+     "score": 100,
+     "detectionMethod": "UbuntuAPIMatch"
+    }
+   ],
+   "affectedPackages": [
+    {
+     "name": "linux-headers-7.0.0-43-generic",
+     "notFixedYet": true,
+     "fixState": "needed"
+    },
+    {
+     "name": "linux-hwe-7.0-headers-7.0.0-43",
+     "notFixedYet": true,
+     "fixState": "needed"
+    },
+    {
+     "name": "linux-hwe-7.0-tools-7.0.0-43",
+     "notFixedYet": true,
+     "fixState": "needed"
+    }
+   ],
+   "cveContents": {
+    "nvd": [
+     {
+      "type": "nvd",
+      "cveID": "CVE-2013-4739",
+      "cvss2Score": 4.9,
+      "cvss3Score": 0,
+      "cvss3Severity": "",
+      "cvss3Vector": ""
+     }
+    ]
+   }
+  }
+ },
+ "packages": {
+  "libslang2": {
+   "name": "libslang2",
+   "version": "2.3.3-3build2",
+   "release": "",
+   "newVersion": "",
+   "newRelease": "",
+   "arch": "",
+   "repository": "",
+   "modularitylabel": ""
+  },
+  "amd64-microcode": {
+   "name": "amd64-microcode",
+   "version": "3.20251202.1ubuntu0.24.04.1",
+   "release": "",
+   "newVersion": "",
+   "newRelease": "",
+   "arch": "",
+   "repository": "",
+   "modularitylabel": ""
+  },
+  "linux-headers-7.0.0-43-generic": {
+   "name": "linux-headers-7.0.0-43-generic",
+   "version": "7.0.0-43.43~24.04.1",
+   "release": "",
+   "newVersion": "",
+   "newRelease": "",
+   "arch": "",
+   "repository": "",
+   "modularitylabel": ""
+  },
+  "linux-hwe-7.0-headers-7.0.0-43": {
+   "name": "linux-hwe-7.0-headers-7.0.0-43",
+   "version": "7.0.0-43.43~24.04.1",
+   "release": "",
+   "newVersion": "",
+   "newRelease": "",
+   "arch": "",
+   "repository": "",
+   "modularitylabel": ""
+  },
+  "linux-hwe-7.0-tools-7.0.0-43": {
+   "name": "linux-hwe-7.0-tools-7.0.0-43",
+   "version": "7.0.0-43.43~24.04.1",
+   "release": "",
+   "newVersion": "",
+   "newRelease": "",
+   "arch": "",
+   "repository": "",
+   "modularitylabel": ""
+  }
+ }
+}

@@ -5,7 +5,12 @@ CREATE TABLE IF NOT EXISTS scans (
     status      TEXT NOT NULL,
     created_at  TEXT NOT NULL,
     finished_at TEXT,
-    error       TEXT
+    error       TEXT,
+    -- Deep (authenticated, Vuls) scan. Only non-secret login info is stored; the key lives in memory.
+    deep        INTEGER NOT NULL DEFAULT 0,
+    ssh_user    TEXT,
+    ssh_port    INTEGER,
+    ssh_auth    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_scans_status ON scans(status, created_at);
 
@@ -26,6 +31,7 @@ CREATE TABLE IF NOT EXISTS findings (
     priority    REAL NOT NULL DEFAULT 0,
     evidence    TEXT NOT NULL DEFAULT '',
     tool        TEXT NOT NULL,
+    fix_available INTEGER,
     UNIQUE (scan_id, fingerprint)
 );
 CREATE INDEX IF NOT EXISTS idx_findings_scan ON findings(scan_id);

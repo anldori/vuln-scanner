@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install.sh - install everything vuln-scanner needs, then start the portal.
 #
-# Default (no options): install Rust, nmap, nuclei + templates WITHOUT asking,
+# Default (no options): install Rust, rustscan, vuls, nuclei + templates WITHOUT asking,
 # put the tools on PATH (this session and ~/.bashrc / ~/.zshrc), build, and run the server.
 #
 # Usage: ./install.sh [options]
@@ -13,7 +13,9 @@
 #   --dry-run        print what would be done, change nothing
 #   --prefix DIR     where to put downloaded binaries (default: ~/.local/bin)
 #   --no-rust        skip the Rust toolchain
-#   --no-nmap        skip nmap
+#   --with-nmap      also install nmap (optional; the built-in Rust portscan is the default)
+#   --no-rustscan    skip RustScan (the default port scanner)
+#   --no-vuls        skip Vuls (deep scan over SSH; its ~15 GB vulnerability DB downloads on first use)
 #   --no-nuclei      skip nuclei and its templates
 #   -y, --yes        accepted for compatibility (already the default)
 #   -h, --help       show this help
@@ -25,9 +27,10 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 PREFIX="${HOME}/.local/bin"
-CHECK=0 DRY=0 YES=1 DO_RUST=1 DO_NMAP=1 DO_NUCLEI=1 DO_RUN=1
+CHECK=0 DRY=0 YES=1 DO_RUST=1 DO_NMAP=0 DO_RUSTSCAN=1 DO_VULS=1 DO_NUCLEI=1 DO_RUN=1
 SCOPE_ARG="${SCOPE:-}"
 NUCLEI_REPO="projectdiscovery/nuclei"
+VULS_REPO="future-architect/vuls"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------- output helpers ----------
@@ -38,7 +41,7 @@ warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*" >&2; }
 bad()  { printf '  %s✘%s %s\n' "$R" "$N" "$*"; }
 die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
 
-usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -50,7 +53,10 @@ while [ $# -gt 0 ]; do
     --scope) [ $# -ge 2 ] || die "--scope needs a value"; SCOPE_ARG="$2"; shift ;;
     --prefix) [ $# -ge 2 ] || die "--prefix needs a directory"; PREFIX="$2"; shift ;;
     --no-rust) DO_RUST=0 ;;
+    --with-nmap) DO_NMAP=1 ;;
     --no-nmap) DO_NMAP=0 ;;
+    --no-rustscan) DO_RUSTSCAN=0 ;;
+    --no-vuls) DO_VULS=0 ;;
     --no-nuclei) DO_NUCLEI=0 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
@@ -62,8 +68,8 @@ done
 OS="$(uname -s)"
 ARCH_RAW="$(uname -m)"
 case "$OS" in
-  Linux)  NUCLEI_OS=linux ;;
-  Darwin) NUCLEI_OS=macOS ;;
+  Linux)  NUCLEI_OS=linux;  VULS_OS=linux ;;
+  Darwin) NUCLEI_OS=macOS;  VULS_OS=darwin ;;
   *) die "unsupported OS: $OS (Linux and macOS only)" ;;
 esac
 case "$ARCH_RAW" in
@@ -132,6 +138,13 @@ print_status() {
   if [ "$DO_NMAP" -eq 1 ]; then
     if have nmap; then ok "nmap: $(nmap --version | head -1)"; else bad "nmap (missing)"; missing=1; fi
   fi
+  if [ "$DO_RUSTSCAN" -eq 1 ]; then
+    if have rustscan; then ok "rustscan: $(rustscan --version 2>&1 | head -1)"; else bad "rustscan (missing)"; missing=1; fi
+  fi
+  if [ "$DO_VULS" -eq 1 ]; then
+    if have vuls; then ok "vuls: $(vuls -v 2>&1 | head -1 | cut -c1-40)"; else bad "vuls (missing)"; missing=1; fi
+    if have ssh && have ssh-keyscan && have ssh-keygen; then ok "openssh client (needed by deep scan)"; else bad "openssh client: ssh, ssh-keyscan, ssh-keygen (missing)"; missing=1; fi
+  fi
   if [ "$DO_NUCLEI" -eq 1 ]; then
     if have nuclei; then
       ok "nuclei: $(nuclei -version 2>&1 | grep -io 'v[0-9][0-9.]*' | head -1)"
@@ -190,6 +203,45 @@ install_nmap() {
   pkg_install nmap
 }
 
+install_rustscan() {
+  info "Installing rustscan"
+  if have rustscan; then ok "rustscan already installed"; return; fi
+  have cargo || { warn "rustscan needs cargo (do not pass --no-rust)"; return; }
+  confirm "Install rustscan with cargo (into ~/.cargo/bin)?" || { warn "skipped rustscan"; return; }
+  run cargo install rustscan
+}
+
+install_vuls() {
+  info "Installing vuls"
+  if have vuls; then ok "vuls already installed"; return; fi
+  confirm "Download vuls from github.com/${VULS_REPO} into ${PREFIX}?" || { warn "skipped vuls"; return; }
+  if [ "$DRY" -eq 1 ]; then
+    echo "  [dry-run] resolve latest release of ${VULS_REPO}, download vuls_<ver>_${VULS_OS}_${NUCLEI_ARCH}.tar.gz, verify sha256, install to ${PREFIX}"
+    return
+  fi
+  case "$NUCLEI_ARCH" in amd64|arm64) ;; *) warn "no prebuilt vuls for ${ARCH_RAW}; skipped"; return ;; esac
+  local tag ver tmp tgz sums want got
+  tag="$(curl -fsSL "https://api.github.com/repos/${VULS_REPO}/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
+  [ -n "$tag" ] || die "could not determine the latest vuls release (GitHub API rate limit?)"
+  ver="${tag#v}"
+  tgz="vuls_${ver}_${VULS_OS}_${NUCLEI_ARCH}.tar.gz"
+  sums="vuls_${ver}_checksums.txt"
+  tmp="$(mktemp -d)"
+  curl -fsSL -o "${tmp}/${tgz}" "https://github.com/${VULS_REPO}/releases/download/${tag}/${tgz}"
+  curl -fsSL -o "${tmp}/${sums}" "https://github.com/${VULS_REPO}/releases/download/${tag}/${sums}"
+  want="$(awk -v f="$tgz" '$2==f {print $1}' "${tmp}/${sums}")"
+  [ -n "$want" ] || die "no checksum for ${tgz} in ${sums}"
+  if have sha256sum; then got="$(sha256sum "${tmp}/${tgz}" | awk '{print $1}')"; else got="$(shasum -a 256 "${tmp}/${tgz}" | awk '{print $1}')"; fi
+  [ "$want" = "$got" ] || die "checksum mismatch for ${tgz} (expected ${want}, got ${got})"
+  ok "checksum verified"
+  mkdir -p "$PREFIX"
+  tar -xzf "${tmp}/${tgz}" -C "$tmp" vuls
+  install -m 0755 "${tmp}/vuls" "${PREFIX}/vuls"
+  rm -rf "$tmp"
+  ok "vuls ${ver} installed to ${PREFIX}/vuls"
+  warn "the vulnerability DB (~15 GB) is downloaded by the first deep scan into ~/.local/share/vuln-scanner/vuls.db"
+}
+
 install_nuclei() {
   info "Installing nuclei"
   if have nuclei; then
@@ -234,6 +286,8 @@ info "vuln-scanner installer  (os=${OS} arch=${ARCH_RAW} pkg-manager=${PM:-none}
 install_base
 [ "$DO_RUST" -eq 1 ] && install_rust
 [ "$DO_NMAP" -eq 1 ] && install_nmap
+[ "$DO_RUSTSCAN" -eq 1 ] && install_rustscan
+[ "$DO_VULS" -eq 1 ] && install_vuls
 [ "$DO_NUCLEI" -eq 1 ] && install_nuclei
 
 # Make the tools available to this script, to the server we are about to start, and to future shells.

@@ -82,6 +82,16 @@ pub struct Scan {
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// Authenticated scan over SSH with Vuls. The credentials themselves are never stored.
+    #[serde(default)]
+    pub deep: bool,
+    #[serde(default)]
+    pub ssh_user: Option<String>,
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+    /// `key`, `key+passphrase` or `password` (a label only).
+    #[serde(default)]
+    pub ssh_auth: Option<String>,
 }
 
 /// A normalized result produced by any scanner plugin.
@@ -107,6 +117,9 @@ pub struct Finding {
     pub priority: f32,
     pub evidence: String,
     pub tool: String,
+    /// Whether a vendor fix exists, when the scanner knows (Vuls). `None` = unknown / not applicable.
+    #[serde(default)]
+    pub fix_available: Option<bool>,
 }
 
 /// Enrichment data for a single CVE.
@@ -201,6 +214,7 @@ mod tests {
             priority: 0.0,
             evidence: String::new(),
             tool: "t".into(),
+            fix_available: None,
         }
     }
 

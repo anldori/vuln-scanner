@@ -1,9 +1,11 @@
+use crate::creds::CredStore;
 use crate::db;
 use anyhow::{bail, Result};
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
-use vs_core::{CveInfo, Finding, ScanOptions, Scanner, Scope, Target};
+use vs_core::{CveInfo, Finding, Scan, ScanOptions, Scanner, Scope, Target};
+use vs_scanners::Vuls;
 use vs_enrich::Enricher;
 
 pub struct Worker {
@@ -12,6 +14,9 @@ pub struct Worker {
     pub scanners: Vec<Box<dyn Scanner>>,
     /// `None` disables enrichment (offline / air-gapped use).
     pub enricher: Option<Enricher>,
+    /// Authenticated scanner, used only for deep scans.
+    pub vuls: Option<Vuls>,
+    pub creds: CredStore,
 }
 
 impl Worker {
@@ -19,10 +24,16 @@ impl Worker {
     pub async fn run_loop(self) {
         loop {
             match db::claim_next(&self.pool).await {
-                Ok(Some((id, target))) => {
-                    tracing::info!(%id, %target, "scan started");
-                    db::audit(&self.pool, "scan_started", &format!("{id} {target}")).await;
-                    match self.run_one(&id, &target).await {
+                Ok(Some(scan)) => {
+                    let (id, target) = (scan.id.clone(), scan.target.clone());
+                    // Never log secrets: only user/port of a deep scan.
+                    let deep = match (scan.deep, &scan.ssh_user) {
+                        (true, Some(u)) => format!(" deep user={u} port={} auth={}", scan.ssh_port.unwrap_or(22), scan.ssh_auth.as_deref().unwrap_or("key")),
+                        _ => String::new(),
+                    };
+                    tracing::info!(%id, %target, deep = scan.deep, "scan started");
+                    db::audit(&self.pool, "scan_started", &format!("{id} {target}{deep}")).await;
+                    match self.run_one(&scan).await {
                         Ok((n, notes)) => {
                             tracing::info!(%id, findings = n, "scan done");
                             let note = notes.as_deref().unwrap_or("");
@@ -46,9 +57,12 @@ impl Worker {
         }
     }
 
-    async fn run_one(&self, id: &str, target: &str) -> Result<(usize, Option<String>)> {
+    async fn run_one(&self, scan: &Scan) -> Result<(usize, Option<String>)> {
+        let id = scan.id.as_str();
+        // Take the secret out of the store first so it is gone on every path (error, scope reject...).
+        let ssh = if scan.deep { self.creds.take(id) } else { None };
         // Re-validate at execution time (defence in depth: DB contents are not trusted).
-        let target = Target::parse(target)?;
+        let target = Target::parse(&scan.target)?;
         self.scope.check(&target)?;
 
         let opts = ScanOptions::default();
@@ -67,6 +81,29 @@ impl Worker {
                 Err(e) => {
                     tracing::warn!(%id, scanner = sc.name(), "scanner failed: {e:#}");
                     errors.push(format!("{}: {e:#}", sc.name()));
+                }
+            }
+        }
+
+        if scan.deep {
+            // Authenticated scan. Credentials are consumed here and dropped (zeroized) right after.
+            let res = match (&self.vuls, ssh) {
+                (None, _) => Err(anyhow::anyhow!("Vuls is not available on this server")),
+                (_, None) => Err(anyhow::anyhow!("SSH credentials are no longer available (server restarted?); submit the scan again")),
+                (Some(v), Some(creds)) => {
+                    let deep_opts = ScanOptions { ssh: Some(creds), ..opts.clone() };
+                    v.run(&target, &deep_opts).await
+                }
+            };
+            match res {
+                Ok(f) => {
+                    tracing::info!(%id, scanner = "vuls", findings = f.len(), "scanner finished");
+                    succeeded += 1;
+                    findings.extend(f);
+                }
+                Err(e) => {
+                    tracing::warn!(%id, scanner = "vuls", "scanner failed: {e:#}");
+                    errors.push(format!("vuls (deep scan): {e:#}"));
                 }
             }
         }

@@ -9,8 +9,14 @@ use tokio::process::Command;
 /// Run `binary` with `args` (argv, never a shell string) and return its stdout.
 /// The process is killed if it exceeds `timeout_secs`. Non-zero exit is an error.
 pub async fn run_capture(binary: &str, args: &[String], timeout_secs: u64) -> Result<String> {
+    run_capture_env(binary, args, timeout_secs, &[]).await
+}
+
+/// Like [`run_capture`], with extra environment variables for the child (e.g. `SSH_ASKPASS`).
+pub async fn run_capture_env(binary: &str, args: &[String], timeout_secs: u64, env: &[(String, String)]) -> Result<String> {
     let mut child = Command::new(binary)
         .args(args)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -50,4 +56,9 @@ pub fn is_available(binary: &str) -> bool {
     std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join(binary).is_file()))
         .unwrap_or(false)
+}
+
+/// Absolute path of `binary` as found on `PATH`.
+pub fn which(binary: &str) -> Option<std::path::PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(binary)).find(|p| p.is_file())
 }

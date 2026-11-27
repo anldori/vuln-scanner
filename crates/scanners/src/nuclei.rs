@@ -162,6 +162,7 @@ pub fn parse_jsonl(out: &str) -> Vec<Finding> {
             priority: 0.0,
             evidence,
             tool: "nuclei".into(),
+            fix_available: None,
         });
     }
     findings

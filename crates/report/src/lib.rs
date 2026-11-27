@@ -203,11 +203,12 @@ pub fn finding_rows(findings: &[Finding]) -> String {
             format!("{}{}", v.join("<br>"), kev_cell(f))
         };
         h.push_str(&format!(
-            "<tr data-sev=\"{sev}\"><td>{badge}<span class=\"bar\" title=\"priority {p:.1}/100\"><i style=\"width:{w:.0}%\"></i></span></td>\
+            "<tr data-sev=\"{sev}\" data-fix=\"{fix}\"><td>{badge}<span class=\"bar\" title=\"priority {p:.1}/100\"><i style=\"width:{w:.0}%\"></i></span></td>\
              <td><span class=\"mono\">{target}</span><div class=\"ev\">{svc}</div></td>\
              <td><span class=\"ft\">{title}</span><span class=\"tag\">{tool}</span>{ev}</td>\
              <td>{cves}</td><td>{scores}</td></tr>",
             sev = f.severity.as_str(),
+            fix = match f.fix_available { Some(true) => "1", Some(false) => "0", None => "" },
             badge = sev_badge(f.severity),
             p = f.priority,
             w = f.priority.clamp(0.0, 100.0),
@@ -284,6 +285,7 @@ mod tests {
             priority: 60.0,
             evidence: "Apache, 2.4".into(),
             tool: "nmap".into(),
+            fix_available: None,
         }
     }
 
@@ -295,6 +297,10 @@ mod tests {
             created_at: Utc::now(),
             finished_at: None,
             error: None,
+            deep: false,
+            ssh_user: None,
+            ssh_port: None,
+            ssh_auth: None,
         }
     }
 
