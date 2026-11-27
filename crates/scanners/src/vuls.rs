@@ -357,8 +357,17 @@ struct Report {
     cves: HashMap<String, Cve>,
     #[serde(default)]
     packages: HashMap<String, Pkg>,
+    /// Source package -> binary packages built from it.
+    #[serde(rename = "SrcPackages", default)]
+    src_packages: HashMap<String, SrcPkg>,
     #[serde(default)]
     errors: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct SrcPkg {
+    #[serde(rename = "binaryNames", default)]
+    binary_names: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -387,6 +396,9 @@ struct Content {
     cvss3: f64,
     #[serde(rename = "cvss2Score", default)]
     cvss2: f64,
+    /// Severity as classified by the source; for `ubuntu_api` this is Ubuntu's own priority.
+    #[serde(rename = "cvss3Severity", default)]
+    severity3: String,
 }
 
 #[derive(Deserialize)]
@@ -409,13 +421,91 @@ fn best_score(contents: &HashMap<String, Vec<Content>>) -> Option<f32> {
     [v3n, v3, v2n, v2].into_iter().find(|s| *s > 0.0).map(|s| s as f32)
 }
 
-/// One finding per CVE per host, listing the affected packages as evidence.
+/// The distro's own priority, `vendor:level` (only Ubuntu is recognised so far).
+fn vendor_priority(contents: &HashMap<String, Vec<Content>>) -> Option<String> {
+    let level = contents.get("ubuntu_api")?.iter().map(|c| c.severity3.to_lowercase()).find(|l| !l.is_empty())?;
+    matches!(level.as_str(), "negligible" | "low" | "medium" | "high" | "critical").then(|| format!("ubuntu:{level}"))
+}
+
+/// Group name for a source package: all kernel flavours (`linux`, `linux-hwe-7.0`,
+/// `linux-signed-hwe-7.0`, ...) collapse into one "linux kernel" group; firmware and helper
+/// packages such as `linux-firmware` or `linux-base` stay separate.
+fn source_family(src: &str) -> String {
+    const FLAVORS: &[&str] = &[
+        "hwe", "oem", "aws", "azure", "gcp", "gke", "kvm", "lowlatency", "raspi", "realtime", "nvidia", "ibm", "oracle", "intel",
+        "generic", "riscv", "starfive", "xilinx", "bluefield", "allwinner",
+    ];
+    if src == "linux" {
+        return "linux kernel".into();
+    }
+    let Some(mut rest) = src.strip_prefix("linux-") else { return src.into() };
+    loop {
+        let before = rest;
+        for p in ["main-", "signed-", "meta-", "restricted-", "modules-"] {
+            rest = rest.strip_prefix(p).unwrap_or(rest);
+        }
+        if rest == before {
+            break;
+        }
+    }
+    let kernel = FLAVORS.iter().any(|f| rest == *f || rest.strip_prefix(*f).is_some_and(|r| r.starts_with('-')))
+        || rest.starts_with(|c: char| c.is_ascii_digit());
+    if kernel { "linux kernel".into() } else { src.into() }
+}
+
+/// Affected binary packages of one CVE, grouped by source family, as human-readable lines.
+fn group_lines(aff: &[&Affected], b2s: &HashMap<&str, &str>, packages: &HashMap<String, Pkg>) -> (Vec<String>, String) {
+    let mut groups: BTreeMap<String, Vec<&Affected>> = BTreeMap::new();
+    for a in aff {
+        let fam = source_family(b2s.get(a.name.as_str()).copied().unwrap_or(a.name.as_str()));
+        groups.entry(fam).or_default().push(a);
+    }
+    let lines: Vec<String> = groups
+        .iter()
+        .map(|(fam, members)| {
+            let status = {
+                let fixed: Vec<&&Affected> = members.iter().filter(|a| !a.fixed_in.is_empty()).collect();
+                if let Some(f) = fixed.first() {
+                    if fixed.len() == members.len() { format!("fixed in {}", f.fixed_in) } else { format!("fix available for {} of {}", fixed.len(), members.len()) }
+                } else {
+                    let state = members.iter().map(|a| a.fix_state.as_str()).find(|s| !s.is_empty());
+                    match state {
+                        Some(st) => format!("no fix yet: {st}"),
+                        None => "no fix yet".into(),
+                    }
+                }
+            };
+            let ver = |a: &Affected| packages.get(&a.name).map(|p| p.version.as_str()).filter(|v| !v.is_empty());
+            if members.len() == 1 {
+                let m = members[0];
+                format!("{}{} ({status})", m.name, ver(m).map(|v| format!(" {v}")).unwrap_or_default())
+            } else {
+                let mut names: Vec<&str> = members.iter().map(|a| a.name.as_str()).collect();
+                names.sort();
+                let shown = names.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+                let more = if names.len() > 3 { format!(", +{} more", names.len() - 3) } else { String::new() };
+                let v = members.iter().find_map(|a| ver(a)).map(|v| format!(" {v}")).unwrap_or_default();
+                format!("{fam}{v}: {} packages ({shown}{more}) ({status})", members.len())
+            }
+        })
+        .collect();
+    let first = groups.keys().next().cloned().unwrap_or_else(|| "system packages".into());
+    let title_target = if groups.len() > 1 { format!("{first} +{} more", groups.len() - 1) } else { first };
+    (lines, title_target)
+}
+
+/// One finding per CVE per host; affected packages are grouped by source package family.
 pub fn parse_report(json: &str, host: &str) -> Result<Vec<Finding>> {
     let r: Report = serde_json::from_str(json).context("invalid vuls report JSON")?;
     if !r.errors.is_empty() {
         let e: String = r.errors.join("; ").chars().take(300).collect();
         bail!("vuls reported errors: {e}");
     }
+    let b2s: HashMap<&str, &str> = r
+        .src_packages
+        .iter()
+        .flat_map(|(src, p)| p.binary_names.iter().map(move |b| (b.as_str(), src.as_str())))
+        .collect();
     let mut ids: Vec<&String> = r.cves.keys().collect();
     ids.sort();
     let mut out = Vec::with_capacity(ids.len());
@@ -423,32 +513,12 @@ pub fn parse_report(json: &str, host: &str) -> Result<Vec<Finding>> {
         let c = &r.cves[id];
         let mut aff: Vec<&Affected> = c.affected.iter().collect();
         aff.sort_by(|a, b| a.name.cmp(&b.name));
-        let desc = |a: &Affected| {
-            let ver = r.packages.get(&a.name).map(|p| p.version.as_str()).filter(|v| !v.is_empty());
-            let mut s = a.name.clone();
-            if let Some(v) = ver {
-                s.push(' ');
-                s.push_str(v);
-            }
-            if !a.fixed_in.is_empty() {
-                s.push_str(&format!(" (fixed in {})", a.fixed_in));
-            } else if a.not_fixed {
-                if a.fix_state.is_empty() {
-                    s.push_str(" (no fix yet)");
-                } else {
-                    s.push_str(&format!(" (no fix yet: {})", a.fix_state));
-                }
-            }
-            s
-        };
-        let shown: Vec<String> = aff.iter().take(8).map(|a| desc(a)).collect();
-        let more = aff.len().saturating_sub(8);
+        let (lines, title_target) = group_lines(&aff, &b2s, &r.packages);
+        let shown: Vec<&str> = lines.iter().take(6).map(String::as_str).collect();
         let mut evidence = shown.join("; ");
-        if more > 0 {
-            evidence.push_str(&format!("; +{more} more"));
+        if lines.len() > 6 {
+            evidence.push_str(&format!("; +{} more groups", lines.len() - 6));
         }
-        let first = aff.first().map(|a| a.name.as_str()).unwrap_or("system packages");
-        let title = if aff.len() > 1 { format!("{id} affects {first} +{} more", aff.len() - 1) } else { format!("{id} affects {first}") };
         let cvss = best_score(&c.contents);
         out.push(Finding {
             fingerprint: Finding::make_fingerprint(host, None, None, &format!("vuls:{id}")),
@@ -456,7 +526,7 @@ pub fn parse_report(json: &str, host: &str) -> Result<Vec<Finding>> {
             port: None,
             protocol: None,
             service: Some("os-package".into()),
-            title,
+            title: format!("{id} affects {title_target}"),
             severity: cvss.map(Severity::from_cvss).unwrap_or(Severity::Medium),
             cve: vec![id.clone()],
             cvss,
@@ -466,6 +536,7 @@ pub fn parse_report(json: &str, host: &str) -> Result<Vec<Finding>> {
             evidence,
             tool: "vuls".into(),
             fix_available: Some(aff.iter().any(|a| !a.not_fixed)),
+            vendor_priority: vendor_priority(&c.contents),
         });
     }
     Ok(out)
@@ -528,6 +599,58 @@ mod tests {
         let t = build_config("10.0.0.5", &c, None, Path::new("/t/c"), Path::new("/db"), true).unwrap();
         assert!(!t.contains("keyPath") && !t.contains("hunter2"), "{t}");
         assert!(t.contains("SkipUpdate = true"));
+    }
+
+    #[test]
+    fn collapses_kernel_sources_but_not_firmware() {
+        for k in ["linux", "linux-hwe-7.0", "linux-signed-hwe-7.0", "linux-main-signed-hwe-7.0", "linux-meta-aws", "linux-6.8", "linux-oem-24.04"] {
+            assert_eq!(source_family(k), "linux kernel", "{k}");
+        }
+        for o in ["linux-firmware", "linux-base", "linux-atm", "openssl", "linux-firmware-amd-graphics"] {
+            assert_eq!(source_family(o), o);
+        }
+    }
+
+    #[test]
+    fn groups_packages_and_reads_ubuntu_priority() {
+        let json = r#"{
+          "packages": {"linux-image-7.0.0-43-generic":{"version":"7.0.0-43.43"},"linux-headers-7.0.0-43":{"version":"7.0.0-43.43"},
+                       "linux-tools-7.0.0-43":{"version":"7.0.0-43.43"},"linux-libc-dev":{"version":"7.0.0-43.43"},"openssl":{"version":"3.0.13"}},
+          "SrcPackages": {"linux-hwe-7.0":{"binaryNames":["linux-headers-7.0.0-43","linux-tools-7.0.0-43","linux-libc-dev"]},
+                          "linux-signed-hwe-7.0":{"binaryNames":["linux-image-7.0.0-43-generic"]},
+                          "openssl":{"binaryNames":["openssl"]}},
+          "scannedCves": {
+            "CVE-9-1": {"cveID":"CVE-9-1","affectedPackages":[
+               {"name":"linux-image-7.0.0-43-generic","notFixedYet":true,"fixState":"needed"},
+               {"name":"linux-headers-7.0.0-43","notFixedYet":true,"fixState":"needed"},
+               {"name":"linux-tools-7.0.0-43","notFixedYet":true,"fixState":"needed"},
+               {"name":"linux-libc-dev","notFixedYet":true,"fixState":"needed"}],
+              "cveContents":{"ubuntu_api":[{"cvss3Severity":"Medium"}],"nvd":[{"cvss3Score":9.8}]}},
+            "CVE-9-2": {"cveID":"CVE-9-2","affectedPackages":[{"name":"openssl","fixedIn":"3.0.14"}],"cveContents":{}}
+          }}"#;
+        let f = parse_report(json, "h").unwrap();
+        let k = &f[0];
+        assert_eq!(k.title, "CVE-9-1 affects linux kernel");
+        assert_eq!(k.evidence.matches("linux kernel").count(), 1, "{}", k.evidence);
+        assert!(k.evidence.contains("4 packages") && k.evidence.contains("no fix yet: needed"), "{}", k.evidence);
+        assert_eq!((k.vendor_priority.as_deref(), k.severity, k.fix_available), (Some("ubuntu:medium"), Severity::Critical, Some(false)));
+        assert_eq!(k.vendor_priority_parts().map(|p| p.2), Some(2));
+        let o = &f[1];
+        assert_eq!(o.evidence, "openssl 3.0.13 (fixed in 3.0.14)");
+        assert_eq!((o.vendor_priority.as_deref(), o.fix_available), (None, Some(true)));
+    }
+
+    /// Run against a real report: `VULS_REPORT_SAMPLE=/path/to/localhost.json cargo test -p vs-scanners -- --ignored`.
+    #[test]
+    #[ignore]
+    fn real_report_sample() {
+        let path = std::env::var("VULS_REPORT_SAMPLE").expect("set VULS_REPORT_SAMPLE");
+        let f = parse_report(&std::fs::read_to_string(path).unwrap(), "h").unwrap();
+        let with_vp = f.iter().filter(|x| x.vendor_priority.is_some()).count();
+        let longest = f.iter().map(|x| x.evidence.len()).max().unwrap_or(0);
+        eprintln!("{} findings, {with_vp} with vendor priority, longest evidence {longest} chars", f.len());
+        eprintln!("{}\n{}", f[0].title, f[0].evidence);
+        assert!(with_vp > 0);
     }
 
     #[test]

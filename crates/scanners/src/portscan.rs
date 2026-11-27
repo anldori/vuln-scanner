@@ -186,6 +186,7 @@ async fn probe(addr: SocketAddr, connect_to: Duration, banner_to: Duration) -> O
         evidence,
         tool: "portscan".into(),
         fix_available: None,
+        vendor_priority: None,
     })
 }
 

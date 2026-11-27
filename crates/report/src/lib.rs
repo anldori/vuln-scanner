@@ -50,7 +50,7 @@ fn csv_field(s: &str) -> String {
 }
 
 pub fn to_csv(findings: &[Finding]) -> String {
-    let mut out = String::from("severity,priority,host,port,protocol,service,title,cve,cvss,epss,kev,evidence,tool\n");
+    let mut out = String::from("severity,priority,host,port,protocol,service,title,cve,cvss,epss,kev,vendor_priority,evidence,tool\n");
     for f in sorted(findings) {
         let cols = [
             f.severity.as_str().to_string(),
@@ -64,6 +64,7 @@ pub fn to_csv(findings: &[Finding]) -> String {
             f.cvss.map(|c| format!("{c:.1}")).unwrap_or_default(),
             f.epss.map(|e| format!("{e:.4}")).unwrap_or_default(),
             if f.kev { "yes".to_string() } else { String::new() },
+            f.vendor_priority.clone().unwrap_or_default(),
             f.evidence.clone(),
             f.tool.clone(),
         ];
@@ -200,14 +201,22 @@ pub fn finding_rows(findings: &[Finding]) -> String {
             if f.epss.is_some() {
                 v.push(format!("EPSS <b>{}</b>", epss_cell(f)));
             }
+            if let Some((vendor, level, _)) = f.vendor_priority_parts() {
+                let mut name = vendor.to_string();
+                if let Some(c) = name.get_mut(0..1) {
+                    c.make_ascii_uppercase();
+                }
+                v.push(format!("<span title=\"The distribution's own priority for this CVE\">{} <b>{}</b></span>", esc(&name), esc(level)));
+            }
             format!("{}{}", v.join("<br>"), kev_cell(f))
         };
         h.push_str(&format!(
-            "<tr data-sev=\"{sev}\" data-fix=\"{fix}\"><td>{badge}<span class=\"bar\" title=\"priority {p:.1}/100\"><i style=\"width:{w:.0}%\"></i></span></td>\
+            "<tr data-sev=\"{sev}\" data-fix=\"{fix}\" data-vp=\"{vp}\"><td>{badge}<span class=\"bar\" title=\"priority {p:.1}/100\"><i style=\"width:{w:.0}%\"></i></span></td>\
              <td><span class=\"mono\">{target}</span><div class=\"ev\">{svc}</div></td>\
              <td><span class=\"ft\">{title}</span><span class=\"tag\">{tool}</span>{ev}</td>\
              <td>{cves}</td><td>{scores}</td></tr>",
             sev = f.severity.as_str(),
+            vp = f.vendor_priority_parts().map(|p| p.2.to_string()).unwrap_or_default(),
             fix = match f.fix_available { Some(true) => "1", Some(false) => "0", None => "" },
             badge = sev_badge(f.severity),
             p = f.priority,
@@ -286,6 +295,7 @@ mod tests {
             evidence: "Apache, 2.4".into(),
             tool: "nmap".into(),
             fix_available: None,
+            vendor_priority: None,
         }
     }
 

@@ -163,6 +163,7 @@ pub fn parse_jsonl(out: &str) -> Vec<Finding> {
             evidence,
             tool: "nuclei".into(),
             fix_available: None,
+            vendor_priority: None,
         });
     }
     findings

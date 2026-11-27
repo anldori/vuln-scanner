@@ -101,6 +101,7 @@ pub async fn get_findings(pool: &SqlitePool, scan_id: &str) -> Result<Vec<Findin
             evidence: r.get("evidence"),
             tool: r.get("tool"),
             fix_available: r.get::<Option<i64>, _>("fix_available").map(|v| v != 0),
+            vendor_priority: r.get("vendor_priority"),
         })
         .collect())
 }
@@ -123,8 +124,8 @@ pub async fn finish_scan(pool: &SqlitePool, id: &str, findings: &[Finding], note
     for f in findings {
         sqlx::query(
             "INSERT OR IGNORE INTO findings \
-             (scan_id, fingerprint, host, port, protocol, service, title, severity, cve, cvss, epss, kev, priority, evidence, tool, fix_available) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (scan_id, fingerprint, host, port, protocol, service, title, severity, cve, cvss, epss, kev, priority, evidence, tool, fix_available, vendor_priority) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(&f.fingerprint)
@@ -142,6 +143,7 @@ pub async fn finish_scan(pool: &SqlitePool, id: &str, findings: &[Finding], note
         .bind(&f.evidence)
         .bind(&f.tool)
         .bind(f.fix_available.map(i64::from))
+        .bind(&f.vendor_priority)
         .execute(&mut *tx)
         .await?;
     }

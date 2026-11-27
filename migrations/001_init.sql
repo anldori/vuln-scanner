@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS findings (
     evidence    TEXT NOT NULL DEFAULT '',
     tool        TEXT NOT NULL,
     fix_available INTEGER,
+    vendor_priority TEXT,
     UNIQUE (scan_id, fingerprint)
 );
 CREATE INDEX IF NOT EXISTS idx_findings_scan ON findings(scan_id);

@@ -178,6 +178,7 @@ pub fn parse_xml(xml: &str) -> Result<Vec<Finding>> {
                 evidence: banner.clone(),
                 tool: "nmap".into(),
                 fix_available: None,
+                vendor_priority: None,
             });
 
             for script in p.scripts.iter().filter(|s| s.id == "vulners") {
@@ -198,6 +199,7 @@ pub fn parse_xml(xml: &str) -> Result<Vec<Finding>> {
                         evidence: banner.clone(),
                         tool: "nmap+vulners".into(),
                         fix_available: None,
+                        vendor_priority: None,
                     });
                 }
             }

@@ -338,6 +338,13 @@ async fn scan_page(State(st): State<AppState>, Path(id): Path<String>) -> Result
         b.push_str(&format!("<button type=\"button\" class=\"stat {0}\" data-f=\"{0}\"><b>{1}</b><span>{0}</span></button>", s.as_str(), n));
     }
     b.push_str("</div><div class=\"toolbar\"><span class=\"muted\" id=\"shown\"></span><span class=\"grow\"></span>");
+    if findings.iter().any(|f| f.vendor_priority.is_some()) {
+        b.push_str(
+            "<label class=\"muted\" title=\"The distribution's own priority for each CVE (often lower than the raw CVSS)\">Vendor priority \
+             <select id=\"vp\"><option value=\"0\">any</option><option value=\"2\">medium and above</option>\
+             <option value=\"3\">high and above</option></select></label>",
+        );
+    }
     let unfixed = findings.iter().filter(|f| f.fix_available == Some(false)).count();
     let fixable = findings.iter().filter(|f| f.fix_available == Some(true)).count();
     if unfixed > 0 {
@@ -456,14 +463,16 @@ async fn api_events(State(st): State<AppState>, Path(id): Path<String>, Query(q)
 /// findings that have no vendor fix, and the cards count only what is not hidden.
 const FILTER_JS: &str = r#"<script>
 (function(){var on=null,rows=[].slice.call(document.querySelectorAll('#ft tbody tr')),
-cards=[].slice.call(document.querySelectorAll('.stat')),lab=document.getElementById('shown'),hf=document.getElementById('hidefix');
-function apply(){var n=0,tot=0,cnt={};rows.forEach(function(r){var v=!(hf&&hf.checked&&r.dataset.fix==='0');
+cards=[].slice.call(document.querySelectorAll('.stat')),lab=document.getElementById('shown'),
+hf=document.getElementById('hidefix'),vp=document.getElementById('vp');
+function apply(){var n=0,tot=0,cnt={},min=vp?+vp.value:0;rows.forEach(function(r){
+var v=!(hf&&hf.checked&&r.dataset.fix==='0')&&!(min&&r.dataset.vp!==''&&+r.dataset.vp<min);
 if(v){tot++;cnt[r.dataset.sev]=(cnt[r.dataset.sev]||0)+1}
 var s=v&&(!on||r.dataset.sev===on);r.style.display=s?'':'none';if(s)n++});
 cards.forEach(function(c){c.classList.toggle('on',c.dataset.f===on);c.querySelector('b').textContent=cnt[c.dataset.f]||0});
-lab.textContent=n+' of '+tot+' findings'+(on?' ('+on+')':'')+(tot<rows.length?' · '+(rows.length-tot)+' unfixed hidden':'')}
+lab.textContent=n+' of '+tot+' findings'+(on?' ('+on+')':'')+(tot<rows.length?' · '+(rows.length-tot)+' hidden by filters':'')}
 cards.forEach(function(c){c.addEventListener('click',function(){on=on===c.dataset.f?null:c.dataset.f;apply()})});
-if(hf)hf.addEventListener('change',apply);apply()})();
+if(hf)hf.addEventListener('change',apply);if(vp)vp.addEventListener('change',apply);apply()})();
 </script>"#;
 
 async fn report(State(st): State<AppState>, Path((id, fmt)): Path<(String, String)>) -> Result<Response, AppError> {

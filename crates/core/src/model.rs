@@ -120,6 +120,26 @@ pub struct Finding {
     /// Whether a vendor fix exists, when the scanner knows (Vuls). `None` = unknown / not applicable.
     #[serde(default)]
     pub fix_available: Option<bool>,
+    /// The distro's own priority for this CVE as `vendor:level`, e.g. `ubuntu:medium`
+    /// (level: negligible, low, medium, high, critical). Often lower than the raw CVSS.
+    #[serde(default)]
+    pub vendor_priority: Option<String>,
+}
+
+impl Finding {
+    /// `(vendor, level, rank 0..=4)` parsed from [`Finding::vendor_priority`].
+    pub fn vendor_priority_parts(&self) -> Option<(&str, &str, u8)> {
+        let (vendor, level) = self.vendor_priority.as_deref()?.split_once(':')?;
+        let rank = match level {
+            "negligible" => 0,
+            "low" => 1,
+            "medium" => 2,
+            "high" => 3,
+            "critical" => 4,
+            _ => return None,
+        };
+        Some((vendor, level, rank))
+    }
 }
 
 /// Enrichment data for a single CVE.
@@ -215,6 +235,7 @@ mod tests {
             evidence: String::new(),
             tool: "t".into(),
             fix_available: None,
+            vendor_priority: None,
         }
     }
 
