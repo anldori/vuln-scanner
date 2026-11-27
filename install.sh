@@ -6,7 +6,7 @@
 #
 # Usage: ./install.sh [options]
 #   --scope VALUE    SCOPE for the server: "any", or e.g. "127.0.0.0/8,192.168.1.0/24"
-#                    (default: $SCOPE if set, otherwise the server's loopback-only default)
+#                    (default: $SCOPE if set, otherwise "any" = scan any target; use --scope "127.0.0.0/8,::1" to restrict)
 #   --no-run         install only, do not start the portal
 #   --ask            ask for confirmation before each install step
 #   --check          only report what is installed / missing, change nothing
@@ -28,7 +28,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 PREFIX="${HOME}/.local/bin"
 CHECK=0 DRY=0 YES=1 DO_RUST=1 DO_NMAP=0 DO_RUSTSCAN=1 DO_VULS=1 DO_NUCLEI=1 DO_RUN=1
-SCOPE_ARG="${SCOPE:-}"
+SCOPE_ARG="${SCOPE:-any}"
 NUCLEI_REPO="projectdiscovery/nuclei"
 VULS_REPO="future-architect/vuls"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -335,6 +335,7 @@ cd "$PROJECT_DIR"
 if [ -n "$SCOPE_ARG" ]; then
   export SCOPE="$SCOPE_ARG"
   info "scope: $SCOPE"
+  [ "$SCOPE" = "any" ] && warn "scope=any: the portal will accept ANY target. Only scan systems you are authorised to test; restrict with --scope \"127.0.0.0/8,::1,<your CIDR>\""
 else
   warn "scope: loopback only (default). To scan other targets: ./install.sh --scope any   (or SCOPE=\"192.168.1.0/24\")"
 fi
