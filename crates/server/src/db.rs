@@ -14,7 +14,32 @@ pub async fn connect(url: &str) -> Result<SqlitePool> {
     sqlx::raw_sql(include_str!("../../../migrations/001_init.sql"))
         .execute(&pool)
         .await?;
+    upgrade_schema(&pool).await?;
     Ok(pool)
+}
+
+/// Columns added after the first release. `CREATE TABLE IF NOT EXISTS` never alters an existing
+/// table, so databases created by older versions get the missing columns added here.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("scans", "deep", "INTEGER NOT NULL DEFAULT 0"),
+    ("scans", "ssh_user", "TEXT"),
+    ("scans", "ssh_port", "INTEGER"),
+    ("scans", "ssh_auth", "TEXT"),
+    ("findings", "fix_available", "INTEGER"),
+    ("findings", "vendor_priority", "TEXT"),
+    ("scan_events", "phase", "TEXT"),
+];
+
+async fn upgrade_schema(pool: &SqlitePool) -> Result<()> {
+    for (table, column, ddl) in ADDED_COLUMNS {
+        // Table and column names are the constants above, never user input.
+        let cols = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info({table})"))).fetch_all(pool).await?;
+        if !cols.iter().any(|c| c.get::<String, _>("name") == *column) {
+            tracing::info!("upgrading database: adding {table}.{column}");
+            sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"))).execute(pool).await?;
+        }
+    }
+    Ok(())
 }
 
 fn parse_ts(s: &str) -> DateTime<Utc> {

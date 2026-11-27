@@ -132,8 +132,8 @@ cargo test -p vs-scanners -- --ignored   # live test; needs the rustscan binary
 ```
 
 Parser tests use fixtures in `crates/scanners/tests/fixtures/`. The database schema is pre-release:
-`migrations/001_init.sql` is edited in place, so delete old dev databases (`rm *.db`) after pulling
-schema changes.
+`migrations/001_init.sql` is edited in place; columns added later are registered in `ADDED_COLUMNS`
+(`crates/server/src/db.rs`) so existing databases are upgraded automatically at startup.
 
 ## Roadmap
 
