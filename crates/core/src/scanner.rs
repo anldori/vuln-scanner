@@ -105,10 +105,13 @@ impl Drop for SshCreds {
 /// Sink for human-readable progress lines shown live in the web UI. Messages must never
 /// contain secrets.
 #[derive(Clone)]
-pub struct Progress(std::sync::Arc<dyn Fn(&str) + Send + Sync>);
+pub struct Progress(std::sync::Arc<ProgressFn>);
+
+type ProgressFn = dyn Fn(&str, Option<&str>, &str) + Send + Sync;
 
 impl Progress {
-    pub fn new(f: impl Fn(&str) + Send + Sync + 'static) -> Self {
+    /// `f(level, phase, message)`; level is `info`, `warn` or `error`.
+    pub fn new(f: impl Fn(&str, Option<&str>, &str) + Send + Sync + 'static) -> Self {
         Self(std::sync::Arc::new(f))
     }
 }
@@ -134,11 +137,25 @@ impl Default for ScanOptions {
 }
 
 impl ScanOptions {
+    fn emit(&self, level: &str, phase: Option<&str>, msg: &str) {
+        if let Some(p) = &self.progress {
+            (p.0)(level, phase, msg);
+        }
+    }
+
     /// Report a progress line (no-op when nobody listens).
     pub fn log(&self, msg: &str) {
-        if let Some(p) = &self.progress {
-            (p.0)(msg);
-        }
+        self.emit("info", None, msg);
+    }
+
+    /// Progress line that also marks the start/continuation of a named phase (shown as a step in the UI).
+    pub fn phase(&self, phase: &str, msg: &str) {
+        self.emit("info", Some(phase), msg);
+    }
+
+    /// Error line belonging to a phase; the UI marks that phase as failed.
+    pub fn fail(&self, phase: &str, msg: &str) {
+        self.emit("error", Some(phase), msg);
     }
 }
 

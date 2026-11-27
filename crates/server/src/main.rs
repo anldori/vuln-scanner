@@ -1,5 +1,6 @@
 mod creds;
 mod db;
+mod newscan;
 mod web;
 mod worker;
 

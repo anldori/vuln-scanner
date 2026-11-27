@@ -11,17 +11,23 @@ use vs_enrich::Enricher;
 
 /// Progress log of one scan: lines are queued here and written to `scan_events` by a task.
 #[derive(Clone)]
-struct Events(UnboundedSender<(&'static str, String)>);
+struct Events(UnboundedSender<(&'static str, Option<String>, String)>);
 
 impl Events {
+    fn send(&self, level: &'static str, phase: Option<&str>, m: impl Into<String>) {
+        let _ = self.0.send((level, phase.map(String::from), m.into()));
+    }
     fn info(&self, m: impl Into<String>) {
-        let _ = self.0.send(("info", m.into()));
+        self.send("info", None, m);
+    }
+    fn phase(&self, phase: &str, m: impl Into<String>) {
+        self.send("info", Some(phase), m);
     }
     fn warn(&self, m: impl Into<String>) {
-        let _ = self.0.send(("warn", m.into()));
+        self.send("warn", None, m);
     }
     fn error(&self, m: impl Into<String>) {
-        let _ = self.0.send(("error", m.into()));
+        self.send("error", None, m);
     }
 }
 
@@ -75,11 +81,11 @@ impl Worker {
     }
 
     async fn run_one(&self, scan: &Scan) -> Result<(usize, Option<String>)> {
-        let (tx, mut rx) = unbounded_channel::<(&'static str, String)>();
+        let (tx, mut rx) = unbounded_channel::<(&'static str, Option<String>, String)>();
         let (pool, sid) = (self.pool.clone(), scan.id.clone());
         let writer = tokio::spawn(async move {
-            while let Some((level, msg)) = rx.recv().await {
-                db::add_event(&pool, &sid, level, &msg).await;
+            while let Some((level, phase, msg)) = rx.recv().await {
+                db::add_event(&pool, &sid, level, phase.as_deref(), &msg).await;
             }
         });
         let ev = Events(tx);
@@ -103,7 +109,11 @@ impl Worker {
 
         let progress = {
             let ev = ev.clone();
-            Progress::new(move |m| ev.info(m))
+            Progress::new(move |level, phase, m| match level {
+                "error" => ev.send("error", phase, m),
+                "warn" => ev.send("warn", phase, m),
+                _ => ev.send("info", phase, m),
+            })
         };
         let opts = ScanOptions { progress: Some(progress), ..ScanOptions::default() };
         ev.info(format!("Scan started: {}{}", scan.target, if scan.deep { " (deep scan)" } else { "" }));
@@ -112,19 +122,53 @@ impl Worker {
         let mut findings: Vec<Finding> = Vec::new();
         let mut succeeded = 0;
 
+        if scan.deep {
+            // Authenticated scan goes first so a bad login shows up within seconds. Credentials are consumed
+            // here and dropped (zeroized) right after.
+            let res = match (&self.vuls, ssh) {
+                (None, _) => {
+                    let m = "Vuls is not available on this server";
+                    ev.send("error", Some("connect"), m);
+                    Err(anyhow::anyhow!(m))
+                }
+                (_, None) => {
+                    let m = "SSH credentials are no longer available (server restarted?); submit the scan again";
+                    ev.send("error", Some("connect"), m);
+                    Err(anyhow::anyhow!(m))
+                }
+                (Some(v), Some(creds)) => {
+                    let deep_opts = ScanOptions { ssh: Some(creds), ..opts.clone() };
+                    v.run(&target, &deep_opts).await // Vuls reports its own progress and heartbeats
+                }
+            };
+            match res {
+                Ok(f) => {
+                    tracing::info!(%id, scanner = "vuls", findings = f.len(), "scanner finished");
+                    ev.phase("vuls", format!("vuls: finished, {} finding(s)", f.len()));
+                    succeeded += 1;
+                    findings.extend(f);
+                }
+                Err(e) => {
+                    tracing::warn!(%id, scanner = "vuls", "scanner failed: {e:#}");
+                    // Vuls has already reported the failure on its own phase.
+                    errors.push(format!("vuls (deep scan): {e:#}"));
+                }
+            }
+        }
+        ev.phase("scan", "Network scan: starting scanners");
         for sc in &self.scanners {
             let name = sc.name();
-            ev.info(format!("{name}: started"));
+            ev.phase("scan", format!("{name}: started"));
             let t0 = std::time::Instant::now();
             // Heartbeat so a long scanner never looks stuck.
             let res = with_ticker(Duration::from_secs(20), sc.run(&target, &opts), |el| {
-                ev.info(format!("{name}: still running ({}s)", el.as_secs()))
+                ev.phase("scan", format!("{name}: still running ({}s)", el.as_secs()))
             })
             .await;
             match res {
                 Ok(f) => {
                     tracing::info!(%id, scanner = name, findings = f.len(), "scanner finished");
-                    ev.info(format!("{name}: finished, {} finding(s) in {}s", f.len(), t0.elapsed().as_secs()));
+                    ev.phase("scan", format!("{name}: finished, {} finding(s) in {}s", f.len(), t0.elapsed().as_secs()));
                     succeeded += 1;
                     findings.extend(f);
                 }
@@ -136,31 +180,6 @@ impl Worker {
             }
         }
 
-        if scan.deep {
-            // Authenticated scan. Credentials are consumed here and dropped (zeroized) right after.
-            let res = match (&self.vuls, ssh) {
-                (None, _) => Err(anyhow::anyhow!("Vuls is not available on this server")),
-                (_, None) => Err(anyhow::anyhow!("SSH credentials are no longer available (server restarted?); submit the scan again")),
-                (Some(v), Some(creds)) => {
-                    ev.info("vuls: deep scan started");
-                    let deep_opts = ScanOptions { ssh: Some(creds), ..opts.clone() };
-                    v.run(&target, &deep_opts).await // Vuls reports its own progress and heartbeats
-                }
-            };
-            match res {
-                Ok(f) => {
-                    tracing::info!(%id, scanner = "vuls", findings = f.len(), "scanner finished");
-                    ev.info(format!("vuls: finished, {} finding(s)", f.len()));
-                    succeeded += 1;
-                    findings.extend(f);
-                }
-                Err(e) => {
-                    tracing::warn!(%id, scanner = "vuls", "scanner failed: {e:#}");
-                    ev.warn(format!("vuls (deep scan): failed: {e:#}"));
-                    errors.push(format!("vuls (deep scan): {e:#}"));
-                }
-            }
-        }
         if succeeded == 0 {
             bail!("all scanners failed: {}", errors.join("; "));
         }
@@ -171,9 +190,9 @@ impl Worker {
 
         if let Some(en) = &self.enricher {
             let n_cve = findings.iter().flat_map(|f| f.cve.iter()).collect::<HashSet<_>>().len();
-            ev.info(format!("Enriching {n_cve} CVE(s) (EPSS / KEV / NVD)..."));
+            ev.phase("enrich", format!("Enriching {n_cve} CVE(s) (EPSS / KEV / NVD)..."));
             let w = with_ticker(Duration::from_secs(20), self.enrich(en, &mut findings), |el| {
-                ev.info(format!("Enrichment still running ({}s)", el.as_secs()))
+                ev.phase("enrich", format!("Enrichment still running ({}s)", el.as_secs()))
             })
             .await;
             w.iter().for_each(|m| ev.warn(format!("enrichment: {m}")));
@@ -184,7 +203,7 @@ impl Worker {
         }
 
         let n = findings.len();
-        ev.info(format!("Saving {n} finding(s)"));
+        ev.phase("save", format!("Saving {n} finding(s)"));
         let notes = if notes.is_empty() { None } else { Some(notes.join(" | ")) };
         db::finish_scan(&self.pool, id, &findings, notes.as_deref()).await?;
         Ok((n, notes))

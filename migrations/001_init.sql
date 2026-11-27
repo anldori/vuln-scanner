@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS scan_events (
     scan_id TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
     ts      TEXT NOT NULL,
     level   TEXT NOT NULL,
+    phase   TEXT,
     message TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_scan_events ON scan_events(scan_id, id);

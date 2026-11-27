@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
+use std::sync::Mutex;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use vs_core::{Finding, ScanOptions, Scanner, Severity, SshAuth, SshCreds, Target};
@@ -116,9 +117,34 @@ exec '{real}' "$@"
     ))
 }
 
+/// Turn raw `ssh` stderr into a message a human can act on.
+fn explain_ssh_error(raw: &str) -> String {
+    let l = raw.to_lowercase();
+    let msg = if l.contains("permission denied") || l.contains("authentication failed") {
+        "authentication failed: the server rejected this user/password/key"
+    } else if l.contains("too many authentication failures") {
+        "authentication failed: too many attempts"
+    } else if l.contains("connection refused") {
+        "connection refused: nothing is listening for SSH on that host/port"
+    } else if l.contains("timed out") || l.contains("timeout") {
+        "connection timed out: host is unreachable or the port is firewalled"
+    } else if l.contains("no route to host") || l.contains("network is unreachable") {
+        "no route to host"
+    } else if l.contains("could not resolve") || l.contains("name or service not known") {
+        "cannot resolve the host name"
+    } else if l.contains("host key verification failed") {
+        "host key verification failed"
+    } else {
+        let tail: String = raw.trim().chars().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect();
+        return format!("SSH login failed: {tail}");
+    };
+    format!("SSH connection check failed - {msg}")
+}
+
 /// Never let a secret leak through an error message (stderr tails come from external tools).
 fn redact(msg: String, secrets: &[&str]) -> String {
-    secrets.iter().filter(|s| !s.is_empty()).fold(msg, |m, s| m.replace(s, "<redacted>"))
+    // Very short secrets would mangle ordinary words; they never appear in tool output anyway.
+    secrets.iter().filter(|s| s.len() >= 6).fold(msg, |m, s| m.replace(s, "<redacted>"))
 }
 
 #[async_trait]
@@ -129,18 +155,21 @@ impl Scanner for Vuls {
 
     async fn run(&self, target: &Target, opts: &ScanOptions) -> Result<Vec<Finding>> {
         let creds = opts.ssh.as_ref().context("deep scan needs SSH credentials")?;
-        self.run_inner(target, opts, creds).await.map_err(|e| {
+        let stage = Mutex::new("connect");
+        self.run_inner(target, opts, creds, &stage).await.map_err(|e| {
             let secrets: Vec<&str> = match &creds.auth {
                 SshAuth::Password(p) => vec![p.as_str()],
                 SshAuth::Key { private_key, passphrase } => vec![private_key.as_str(), passphrase.as_deref().unwrap_or("")],
             };
-            anyhow!(redact(format!("{e:#}"), &secrets))
+            let msg = redact(format!("{e:#}"), &secrets);
+            opts.fail(stage.lock().map(|g| *g).unwrap_or("vuls"), &msg); // marks the phase as failed in the UI
+            anyhow!(msg)
         })
     }
 }
 
 impl Vuls {
-    async fn run_inner(&self, target: &Target, opts: &ScanOptions, creds: &SshCreds) -> Result<Vec<Finding>> {
+    async fn run_inner(&self, target: &Target, opts: &ScanOptions, creds: &SshCreds, stage: &Mutex<&'static str>) -> Result<Vec<Finding>> {
         // Re-validate (defence in depth): user/port/key end up in files and argv.
         match &creds.auth {
             SshAuth::Password(p) => SshCreds::password(&creds.user, creds.port, p),
@@ -189,7 +218,7 @@ impl Vuls {
             auth_opts.push_str("  BatchMode yes\n");
         }
 
-        opts.log(&format!("vuls: preparing SSH login for {}@{host}:{} ({})", creds.user, creds.port, creds.method()));
+        opts.phase("connect", &format!("Checking SSH connection to {}@{host}:{} (auth: {})", creds.user, creds.port, creds.method()));
         if key_pem.is_some() {
             // Fail early and clearly on a broken key or a missing/wrong passphrase.
             let key_s = key.to_str().context("temp path")?.to_string();
@@ -207,7 +236,7 @@ impl Vuls {
             })?;
         }
 
-        opts.log("vuls: fetching the SSH host key");
+        opts.phase("connect", "Contacting the SSH server and fetching its host key");
         // Pin the host key for this scan only (trust-on-first-use against the scoped target).
         let scan = run_capture(
             "ssh-keyscan",
@@ -215,7 +244,9 @@ impl Vuls {
             30,
         )
         .await
-        .with_context(|| format!("ssh-keyscan {host}:{}", creds.port))?;
+        .map_err(|_| {
+            anyhow!("SSH connection check failed - cannot reach {host}:{} (connection refused, timed out, or SSH is not running)", creds.port)
+        })?;
         if !scan.lines().any(|l| !l.starts_with('#') && !l.trim().is_empty()) {
             bail!("no SSH host key from {host}:{} (is sshd reachable?)", creds.port);
         }
@@ -223,6 +254,37 @@ impl Vuls {
         write_private(&ssh_config, &format!("Host *\n  UserKnownHostsFile \"{}\"\n{auth_opts}", known_hosts.display()))?;
         let key_opt = key_pem.map(|_| key.as_path());
         write_private(&cfg_path, &build_config(&host, creds, key_opt, &ssh_config, &self.db_path, self.skip_db_update)?)?;
+
+        if let Some(line) = run_capture("ssh-keygen", &["-l".into(), "-f".into(), known_hosts.display().to_string()], 10)
+            .await
+            .ok()
+            .and_then(|o| o.lines().next().map(String::from))
+        {
+            // "256 SHA256:abc... host (ED25519)" -> "ED25519 SHA256:abc..."
+            let w: Vec<&str> = line.split_whitespace().collect();
+            if w.len() >= 2 {
+                opts.phase("connect", &format!("SSH server is reachable. Host key: {} {}", w.last().unwrap_or(&"").trim_matches(['(', ')']), w[1]));
+            }
+        }
+        // Real login test, so a wrong user/password/key is reported clearly and early.
+        let real_ssh = which("ssh").context("`ssh` not found on PATH")?;
+        let mut login: Vec<String> = [
+            "-F", &ssh_config.display().to_string(), "-p", &creds.port.to_string(), "-l", &creds.user,
+            "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "-o", "LogLevel=ERROR",
+        ]
+        .map(String::from)
+        .to_vec();
+        if key_pem.is_some() {
+            login.extend(["-i".into(), key.display().to_string()]);
+        }
+        login.extend(["--".into(), host.clone(), "uname -sr".into()]);
+        let uname = run_capture_env(&real_ssh.display().to_string(), &login, 30, &env)
+            .await
+            .map_err(|e| anyhow!(explain_ssh_error(&format!("{e:#}"))))?;
+        opts.phase("connect", &format!("Login OK as {}: {}", creds.user, uname.trim()));
+        if let Ok(mut g) = stage.lock() {
+            *g = "vuls";
+        }
 
         let common = |sub: &str| -> Vec<String> {
             vec![
@@ -232,20 +294,20 @@ impl Vuls {
                 format!("-log-dir={}", logs.display()),
             ]
         };
-        opts.log("vuls: logging in over SSH and collecting installed packages");
+        opts.phase("vuls", "Collecting installed packages over SSH");
         let mut scan_args = common("scan");
         scan_args.extend([format!("-cachedb-path={}", cache.display()), "-quiet".into(), SERVER.into()]);
         with_ticker(
             Duration::from_secs(10),
             run_capture_env(&self.binary, &scan_args, opts.timeout_secs, &env),
-            |el| opts.log(&format!("vuls: scan still running ({}s)", el.as_secs())),
+            |el| opts.phase("vuls", &format!("Package collection still running ({}s)", el.as_secs())),
         )
         .await
         .context(
             "vuls scan failed (check the SSH user, password/key and that the account can log in over SSH)",
         )?;
 
-        opts.log("vuls: matching packages against the vulnerability DB (the first run downloads ~15 GB)");
+        opts.phase("vuls", "Matching packages against the vulnerability DB (the first run downloads ~15 GB)");
         let mut report_args = common("report");
         report_args.extend(
             ["-format-json", "-to-localfile", "-no-progress", "-quiet", "-trivy-skip-db-update", "-trivy-skip-java-db-update"]
@@ -257,16 +319,16 @@ impl Vuls {
             run_capture_env(&self.binary, &report_args, self.report_timeout_secs, &env),
             |el| {
                 let size = std::fs::metadata(&db).map(|m| format!(", DB file {:.1} GB", m.len() as f64 / 1e9)).unwrap_or_default();
-                opts.log(&format!("vuls: report still running ({}s{size})", el.as_secs()));
+                opts.phase("vuls", &format!("CVE matching still running ({}s{size})", el.as_secs()));
             },
         )
         .await
         .context("vuls report")?;
 
-        opts.log("vuls: reading results");
+        opts.phase("vuls", "Reading results");
         let json = read_result(&results)?;
         let findings = parse_report(&json, &host)?;
-        opts.log(&format!("vuls: {} CVE(s) detected", findings.len()));
+        opts.phase("vuls", &format!("{} CVE(s) detected on the host", findings.len()));
         Ok(findings)
     }
 }
@@ -469,11 +531,21 @@ mod tests {
     }
 
     #[test]
+    fn explains_ssh_errors() {
+        let e = |s: &str| explain_ssh_error(s);
+        assert!(e("`ssh` exited with 255: tester@127.0.0.1: Permission denied (publickey,password).").contains("authentication failed"));
+        assert!(e("ssh: connect to host 10.0.0.9 port 22: Connection refused").contains("connection refused"));
+        assert!(e("ssh: connect to host 10.0.0.9 port 22: Connection timed out").contains("timed out"));
+        assert!(e("something odd").starts_with("SSH login failed: something odd"));
+    }
+
+    #[test]
     fn shim_drops_only_the_two_options_and_redaction_works() {
         let sh = ssh_shim(Path::new("/usr/bin/ssh")).unwrap();
         assert!(sh.contains("exec '/usr/bin/ssh'") && sh.contains("PasswordAuthentication=*"));
         assert!(ssh_shim(Path::new("/tmp/it's/ssh")).is_err());
         assert_eq!(redact("bad hunter2 here".into(), &["hunter2", ""]), "bad <redacted> here");
+        assert_eq!(redact("exited with exit".into(), &["x"]), "exited with exit"); // too short to redact safely
     }
 
     #[tokio::test]

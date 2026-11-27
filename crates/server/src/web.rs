@@ -1,5 +1,6 @@
 use crate::creds::CredStore;
 use crate::db;
+use crate::newscan;
 use axum::extract::{Form, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -23,6 +24,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/scans", post(create_scan))
+        .route("/scans/new", get(new_scan_page))
         .route("/scans/{id}", get(scan_page))
         .route("/scans/{id}/report/{fmt}", get(report))
         .route("/api/scans", get(api_list))
@@ -36,9 +38,6 @@ pub fn router(state: AppState) -> Router {
 pub struct AppError(StatusCode, String);
 
 impl AppError {
-    fn bad_request(msg: impl ToString) -> Self {
-        AppError(StatusCode::BAD_REQUEST, msg.to_string())
-    }
     fn not_found() -> Self {
         AppError(StatusCode::NOT_FOUND, "not found".into())
     }
@@ -96,18 +95,25 @@ fn count_chips(c: &[i64; 5]) -> String {
 
 // ---- handlers ----
 
-async fn index(State(st): State<AppState>) -> Result<Html<String>, AppError> {
+#[derive(Deserialize)]
+struct IndexQuery {
+    queued: Option<usize>,
+}
+
+async fn index(State(st): State<AppState>, Query(q): Query<IndexQuery>) -> Result<Html<String>, AppError> {
+    let queued = q.queued;
     let scans = db::list_scans(&st.pool).await?;
     let counts = db::severity_counts(&st.pool).await?;
     let mut b = format!(
-        "<h1>New scan</h1><p class=\"sub\">Scan a host, IP or CIDR. Scope: <code>{scope}</code></p>\
-         <form class=\"card pad\" method=\"post\" action=\"/scans\" autocomplete=\"off\"><div class=\"hero\">\
-         <input name=\"target\" required autofocus autocomplete=\"off\" placeholder=\"127.0.0.1  ·  192.168.1.0/24  ·  host.lab\" aria-label=\"Target\">\
-         <button class=\"btn\">Start scan</button></div>{deep}</form>\
-         <h2>Recent scans</h2>",
+        "<div class=\"toolbar\" style=\"margin-top:.2rem\"><div><h1 style=\"margin:0\">Scans</h1>\
+         <p class=\"sub\" style=\"margin:.2rem 0 0\">Scope: <code>{scope}</code></p></div><span class=\"grow\"></span>\
+         <a class=\"btn\" href=\"/scans/new\">+ New scan</a></div>",
         scope = esc(&st.scope.describe()),
-        deep = deep_form(&st),
     );
+    if let Some(n) = queued.filter(|n| *n > 0) {
+        b.push_str(&format!("<div class=\"notice\">Queued {n} scans. They run one after another; open one to follow its progress.</div>"));
+    }
+    b.push_str("<h2>Recent scans</h2>");
     if scans.is_empty() {
         b.push_str("<div class=\"card empty\">No scans yet. Start one above.</div>");
     } else {
@@ -132,8 +138,14 @@ async fn index(State(st): State<AppState>) -> Result<Html<String>, AppError> {
 
 #[derive(Deserialize)]
 struct NewScan {
+    /// Several hosts: newline / comma / space separated. `target` is the legacy single-host field.
+    #[serde(default)]
+    targets: String,
+    #[serde(default)]
     target: String,
-    /// Checkbox: present ("on") when deep scan is requested.
+    /// `basic` (default) or `deep`. The legacy `deep=on` checkbox is still honoured.
+    #[serde(default)]
+    scan_type: String,
     #[serde(default)]
     deep: Option<String>,
     #[serde(default)]
@@ -151,32 +163,6 @@ struct NewScan {
     ssh_passphrase: String,
 }
 
-/// Deep-scan part of the new-scan form. Secrets are never rendered back.
-fn deep_form(st: &AppState) -> String {
-    let (disabled, note) = match &st.deep_off {
-        Some(reason) => (" disabled", format!("<div class=\"muted\" style=\"margin-top:8px\">{}</div>", esc(reason))),
-        None => ("", String::new()),
-    };
-    format!(
-        "<div style=\"margin-top:14px\"><label><input type=\"checkbox\" name=\"deep\" id=\"deep\"{disabled}> \
-         <b>Deep scan with Vuls</b> <span class=\"muted\">(log in over SSH and check installed packages for CVEs)</span></label>{note}\
-         <div id=\"deepbox\" hidden style=\"margin-top:10px;display:grid;gap:8px;max-width:640px\">\
-         <div style=\"display:flex;gap:8px\">\
-         <input name=\"ssh_user\" placeholder=\"SSH user\" autocomplete=\"off\" maxlength=\"32\" aria-label=\"SSH user\" style=\"flex:2\">\
-         <input name=\"ssh_port\" placeholder=\"Port (22)\" inputmode=\"numeric\" autocomplete=\"off\" maxlength=\"5\" aria-label=\"SSH port\" style=\"flex:1\">\
-         <select name=\"ssh_auth\" id=\"sshauth\" aria-label=\"Authentication\" style=\"flex:2\"><option value=\"key\">Private key</option><option value=\"password\">Password</option></select></div>\
-         <div id=\"authkey\" style=\"display:grid;gap:8px\">\
-         <textarea name=\"ssh_key\" rows=\"6\" spellcheck=\"false\" autocomplete=\"off\" maxlength=\"16384\" \
-         placeholder=\"-----BEGIN OPENSSH PRIVATE KEY-----&#10;...\" aria-label=\"SSH private key\" style=\"font-family:monospace\"></textarea>\
-         <input type=\"password\" name=\"ssh_passphrase\" placeholder=\"Key passphrase (only if the key is encrypted)\" autocomplete=\"new-password\" maxlength=\"256\" aria-label=\"Key passphrase\"></div>\
-         <div id=\"authpw\" hidden><input type=\"password\" name=\"ssh_password\" placeholder=\"SSH password\" autocomplete=\"new-password\" maxlength=\"256\" aria-label=\"SSH password\" style=\"width:100%\"></div>\
-         <div class=\"muted\">Secrets are kept in memory only for this scan, never stored or logged. The first deep scan on a new machine downloads the Vuls vulnerability DB (~15 GB).</div></div></div>\
-         <script>(function(){{var c=document.getElementById('deep'),b=document.getElementById('deepbox');\
-         var m=document.getElementById('sshauth'),k=document.getElementById('authkey'),w=document.getElementById('authpw');\
-         function f(){{b.hidden=!c.checked;var p=m.value==='password';k.hidden=p;w.hidden=!p}}c.addEventListener('change',f);m.addEventListener('change',f);f()}})();</script>"
-    )
-}
-
 /// Reject cross-site form posts: a browser-sent Origin must match the Host we were addressed as.
 fn check_origin(headers: &HeaderMap) -> Result<(), AppError> {
     let Some(origin) = headers.get(header::ORIGIN) else { return Ok(()) };
@@ -190,52 +176,121 @@ fn check_origin(headers: &HeaderMap) -> Result<(), AppError> {
     }
 }
 
-async fn create_scan(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<NewScan>) -> Result<Redirect, AppError> {
+async fn new_scan_page(State(st): State<AppState>) -> Html<String> {
+    let v = newscan::FormValues { ssh_auth: "key".into(), ..Default::default() };
+    Html(page("New scan", &newscan::form_html(&v, &st.deep_off, &st.scope.describe(), None)))
+}
+
+/// Validation failure: show the form again with what was typed (never the secrets).
+fn form_error(st: &AppState, v: newscan::FormValues, msg: impl AsRef<str>) -> Response {
+    let body = newscan::form_html(&v, &st.deep_off, &st.scope.describe(), Some(msg.as_ref()));
+    (StatusCode::BAD_REQUEST, Html(page("New scan", &body))).into_response()
+}
+
+async fn create_scan(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<NewScan>) -> Result<Response, AppError> {
     check_origin(&headers)?;
-    let target = Target::parse(&f.target).map_err(AppError::bad_request)?;
-    if let Err(e) = st.scope.check(&target) {
-        db::audit(&st.pool, "scan_rejected", &format!("{} ({e})", target.as_arg())).await;
-        return Err(AppError::bad_request(format!(
-            "{}: {e}. Allowed scope: {}. To scan it, restart the server with SCOPE=\"<current scope>,{}\".",
-            target.as_arg(),
-            st.scope.describe(),
-            target.as_arg()
-        )));
+    let deep = f.scan_type == "deep" || f.deep.is_some();
+    let raw_targets = if f.targets.trim().is_empty() { f.target.clone() } else { f.targets.clone() };
+    let vals = newscan::FormValues {
+        targets: raw_targets.clone(),
+        deep,
+        ssh_user: f.ssh_user.clone(),
+        ssh_port: f.ssh_port.clone(),
+        ssh_auth: if f.ssh_auth.is_empty() { "key".into() } else { f.ssh_auth.clone() },
+    };
+
+    // ---- hosts: validate all before queueing any ----
+    let names = newscan::split_targets(&raw_targets);
+    if names.is_empty() {
+        return Ok(form_error(&st, vals, "Enter at least one host."));
     }
-    let id = uuid::Uuid::new_v4().to_string();
-    if f.deep.is_none() {
-        db::create_scan(&st.pool, &id, &target.as_arg(), None).await?;
-        db::audit(&st.pool, "scan_queued", &format!("{id} {}", target.as_arg())).await;
-        return Ok(Redirect::to(&format!("/scans/{id}")));
+    if names.len() > newscan::MAX_HOSTS {
+        return Ok(form_error(&st, vals, format!("Too many hosts ({}); the limit is {} per submission.", names.len(), newscan::MAX_HOSTS)));
+    }
+    let mut targets = Vec::new();
+    let mut problems = Vec::new();
+    let mut out_of_scope = false;
+    for n in &names {
+        match Target::parse(n) {
+            Err(e) => problems.push(format!("{n}: {e}")),
+            Ok(t) => {
+                if let Err(e) = st.scope.check(&t) {
+                    db::audit(&st.pool, "scan_rejected", &format!("{} ({e})", t.as_arg())).await;
+                    out_of_scope = true;
+                    problems.push(format!("{n}: {e}"));
+                } else if deep && matches!(t, Target::Cidr(_)) {
+                    problems.push(format!("{n}: deep scan works on a single host or IP, not a CIDR range"));
+                } else {
+                    targets.push(t);
+                }
+            }
+        }
+    }
+    if !problems.is_empty() {
+        return Ok(form_error(
+            &st,
+            vals,
+            if out_of_scope {
+                format!(
+                    "{}. Allowed scope: {}. To allow more, restart the server with SCOPE=\"<current scope>,<target>\".",
+                    problems.join("; "),
+                    st.scope.describe()
+                )
+            } else {
+                problems.join("; ")
+            },
+        ));
     }
 
-    // ---- deep scan ----
-    if let Some(reason) = &st.deep_off {
-        return Err(AppError::bad_request(reason));
-    }
-    if matches!(target, Target::Cidr(_)) {
-        return Err(AppError::bad_request("Deep scan works on a single host or IP, not a CIDR range."));
-    }
-    let port = match f.ssh_port.trim() {
-        "" => 22,
-        p => p.parse::<u16>().map_err(|_| AppError::bad_request("invalid SSH port"))?,
+    // ---- deep scan login ----
+    let creds = if deep {
+        if let Some(reason) = &st.deep_off {
+            return Ok(form_error(&st, vals, reason));
+        }
+        let port = match f.ssh_port.trim() {
+            "" => Ok(22),
+            p => p.parse::<u16>().map_err(|_| "invalid SSH port".to_string()),
+        };
+        // Error messages never echo the submitted values.
+        let c = port.and_then(|port| match f.ssh_auth.as_str() {
+            "password" => SshCreds::password(&f.ssh_user, port, &f.ssh_password),
+            "" | "key" => SshCreds::key(&f.ssh_user, port, &f.ssh_key, Some(f.ssh_passphrase.as_str())),
+            _ => Err("unknown authentication method".into()),
+        });
+        match c {
+            Ok(c) => Some(c),
+            Err(e) => return Ok(form_error(&st, vals, e)),
+        }
+    } else {
+        None
     };
-    // Error messages never echo the submitted values.
-    let creds = match f.ssh_auth.as_str() {
-        "password" => SshCreds::password(&f.ssh_user, port, &f.ssh_password),
-        "" | "key" => SshCreds::key(&f.ssh_user, port, &f.ssh_key, Some(f.ssh_passphrase.as_str())),
-        _ => Err("unknown authentication method".into()),
+
+    // ---- queue one scan per host ----
+    let mut ids = Vec::new();
+    for t in &targets {
+        let id = uuid::Uuid::new_v4().to_string();
+        match &creds {
+            None => {
+                db::create_scan(&st.pool, &id, &t.as_arg(), None).await?;
+                db::audit(&st.pool, "scan_queued", &format!("{id} {}", t.as_arg())).await;
+            }
+            Some(c) => {
+                // Store the secret BEFORE the scan becomes claimable, and discard it if queueing fails.
+                st.creds.put(&id, c.clone());
+                let info = db::DeepInfo { user: &c.user, port: c.port, auth: c.method() };
+                if let Err(e) = db::create_scan(&st.pool, &id, &t.as_arg(), Some(info)).await {
+                    st.creds.take(&id);
+                    return Err(e.into());
+                }
+                db::audit(&st.pool, "scan_queued", &format!("{id} {} deep user={} port={} auth={}", t.as_arg(), c.user, c.port, c.method())).await;
+            }
+        }
+        ids.push(id);
     }
-    .map_err(AppError::bad_request)?;
-    let (user, port, method) = (creds.user.clone(), creds.port, creds.method());
-    // Store the secret BEFORE the scan becomes claimable, and discard it if queueing fails.
-    st.creds.put(&id, creds);
-    if let Err(e) = db::create_scan(&st.pool, &id, &target.as_arg(), Some(db::DeepInfo { user: &user, port, auth: method })).await {
-        st.creds.take(&id);
-        return Err(e.into());
-    }
-    db::audit(&st.pool, "scan_queued", &format!("{id} {} deep user={user} port={port} auth={method}", target.as_arg())).await;
-    Ok(Redirect::to(&format!("/scans/{id}")))
+    Ok(match ids.as_slice() {
+        [one] => Redirect::to(&format!("/scans/{one}")).into_response(),
+        _ => Redirect::to(&format!("/?queued={}", ids.len())).into_response(),
+    })
 }
 
 async fn load(st: &AppState, id: &str) -> Result<Scan, AppError> {
@@ -275,7 +330,7 @@ async fn scan_page(State(st): State<AppState>, Path(id): Path<String>) -> Result
         b.push_str(&format!("<div class=\"notice{cls}\"><b>{label}:</b> {}</div>", esc(e)));
     }
 
-    b.push_str(&log_panel(&st, &id, active).await?);
+    b.push_str(&log_panel(&st, &scan, active).await?);
 
     let counts = vs_report::severity_counts(&findings);
     b.push_str("<div class=\"stats\">");
@@ -315,8 +370,10 @@ async fn scan_page(State(st): State<AppState>, Path(id): Path<String>) -> Result
     Ok(Html(page_with_head("Scan", head, &b)))
 }
 
-/// Progress log of a scan: rendered server-side from stored events, then polled while the scan is active.
-async fn log_panel(st: &AppState, id: &str, active: bool) -> Result<String, AppError> {
+/// Progress of a scan: a phase stepper plus the event log. Initial content comes from the DB; while the
+/// scan is active the browser polls for new events and reloads the page once the scan ends.
+async fn log_panel(st: &AppState, scan: &Scan, active: bool) -> Result<String, AppError> {
+    let id = scan.id.as_str();
     let events = db::get_events(&st.pool, id, 0).await?;
     if events.is_empty() && !active {
         return Ok(String::new());
@@ -331,29 +388,55 @@ async fn log_panel(st: &AppState, id: &str, active: bool) -> Result<String, AppE
             m = esc(&e.message),
         ));
     }
-    let script = if active {
-        format!(
-            "<script>(function(){{var id={id_js},last={last},log=document.getElementById('log'),idle=document.getElementById('idle'),\
-             lastAt=Date.now();function add(e){{var d=document.createElement('div');d.className='ev-'+e.level;\
-             var t=document.createElement('span');t.className='muted';t.textContent=e.ts.slice(11,19)+' ';d.appendChild(t);\
-             d.appendChild(document.createTextNode(e.message));log.appendChild(d)}}\
-             function tick(){{fetch('/api/scans/'+id+'/events?after='+last,{{cache:'no-store'}}).then(function(r){{return r.json()}}).then(function(j){{\
-             var near=log.scrollHeight-log.scrollTop-log.clientHeight<40;\
-             j.events.forEach(function(e){{add(e);last=e.id;lastAt=Date.now()}});if(near)log.scrollTop=log.scrollHeight;\
-             if(j.status==='done'||j.status==='failed'){{setTimeout(function(){{location.reload()}},500);return}}\
-             setTimeout(tick,2000)}}).catch(function(){{setTimeout(tick,4000)}})}}\
-             setInterval(function(){{var s=Math.round((Date.now()-lastAt)/1000);idle.textContent='last activity '+s+'s ago';\
-             idle.className=s>90?'muted idle-warn':'muted'}},1000);log.scrollTop=log.scrollHeight;tick()}})();</script>",
-            id_js = serde_json::to_string(id).unwrap_or_else(|_| "\"\"".into()),
-        )
-    } else {
-        String::new()
-    };
+    // JSON inside <script>: "<" is escaped so no event text can close the tag.
+    let init = serde_json::json!({
+        "id": id, "last": last, "deep": scan.deep, "status": scan.status, "events": events,
+    })
+    .to_string()
+    .replace('<', "\\u003c");
+    let poll = if active { "true" } else { "false" };
     Ok(format!(
-        "<style>#log{{max-height:260px;overflow:auto;font:.82rem/1.5 ui-monospace,monospace;padding:10px 14px}}\
-         .ev-warn{{color:#b7791f}}.ev-error{{color:#c53030}}.idle-warn{{color:#c53030;font-weight:600}}</style>\
-         <div class=\"card\" style=\"margin-bottom:14px\"><div class=\"toolbar\" style=\"padding:8px 14px 0\"><b>Progress log</b>\
-         <span class=\"grow\"></span><span class=\"muted\" id=\"idle\"></span></div><div id=\"log\">{lines}</div></div>{script}"
+        r##"<style>
+#log{{max-height:280px;overflow:auto;font:.82rem/1.55 ui-monospace,monospace;padding:10px 14px}}
+.ev-warn{{color:var(--medium)}}.ev-error{{color:var(--fail)}}.idle-warn{{color:var(--fail);font-weight:600}}
+.steps{{display:flex;gap:.5rem;flex-wrap:wrap;margin:1rem 0}}
+.step{{display:flex;align-items:center;gap:.45rem;padding:.35rem .8rem .35rem .45rem;border-radius:999px;border:1px solid var(--line);background:var(--card);font-size:.85rem;color:var(--muted)}}
+.step b{{width:1.45rem;height:1.45rem;border-radius:50%;display:grid;place-items:center;font-size:.72rem;background:var(--bg);border:1px solid var(--line)}}
+.step.done{{color:var(--fg)}}.step.done b{{background:var(--ok);border-color:var(--ok);color:#fff}}
+.step.active{{color:var(--fg);border-color:var(--run)}}.step.active b{{background:var(--run);border-color:var(--run);color:#fff;animation:pulse 1s infinite}}
+.step.fail{{color:var(--fail);border-color:var(--fail)}}.step.fail b{{background:var(--fail);border-color:var(--fail);color:#fff}}
+.step.skip{{opacity:.5;text-decoration:line-through}}
+</style>
+<div class="steps" id="steps" aria-label="Scan phases"></div>
+<div class="card" style="margin-bottom:14px"><div class="toolbar" style="padding:8px 14px 0;margin:0"><b>Progress log</b>
+<span class="grow"></span><span class="muted" id="idle"></span></div><div id="log">{lines}</div></div>
+<script>(function(){{
+var S={init},POLL={poll},log=document.getElementById('log'),idle=document.getElementById('idle'),box=document.getElementById('steps'),lastAt=Date.now();
+var ORDER=S.deep?[['connect','Check connection'],['vuls','Vulnerability scan'],['scan','Network scan'],['enrich','Enrich'],['save','Save']]
+ :[['scan','Network scan'],['enrich','Enrich'],['save','Save']];
+function steps(){{
+ var seen={{}},fail={{}},cur=null,fin=S.status==='done'||S.status==='failed';
+ S.events.forEach(function(e){{if(e.phase){{seen[e.phase]=1;cur=e.phase;if(e.level==='error')fail[e.phase]=1}}}});
+ box.textContent='';
+ ORDER.forEach(function(p,i){{
+  var k=p[0],st=fail[k]?'fail':fin?(seen[k]?'done':'skip'):k===cur?'active':seen[k]?'done':'pending';
+  var d=document.createElement('div');d.className='step '+st;
+  var n=document.createElement('b');n.textContent=st==='done'?'✓':st==='fail'?'!':String(i+1);
+  d.appendChild(n);d.appendChild(document.createTextNode(p[1]));box.appendChild(d)}})}}
+function add(e){{var d=document.createElement('div');d.className='ev-'+e.level;
+ var t=document.createElement('span');t.className='muted';t.textContent=e.ts.slice(11,19)+' ';
+ d.appendChild(t);d.appendChild(document.createTextNode(e.message));log.appendChild(d)}}
+steps();log.scrollTop=log.scrollHeight;
+if(POLL){{
+ setInterval(function(){{var s=Math.round((Date.now()-lastAt)/1000);idle.textContent='last activity '+s+'s ago';idle.className=s>90?'muted idle-warn':'muted'}},1000);
+ (function tick(){{fetch('/api/scans/'+S.id+'/events?after='+S.last,{{cache:'no-store'}}).then(function(r){{return r.json()}}).then(function(j){{
+  var near=log.scrollHeight-log.scrollTop-log.clientHeight<40;
+  j.events.forEach(function(e){{add(e);S.events.push(e);S.last=e.id;lastAt=Date.now()}});
+  S.status=j.status;steps();if(near)log.scrollTop=log.scrollHeight;
+  if(j.status==='done'||j.status==='failed'){{setTimeout(function(){{location.reload()}},600);return}}
+  setTimeout(tick,2000)}}).catch(function(){{setTimeout(tick,4000)}})}})()
+}}
+}})();</script>"##
     ))
 }
 

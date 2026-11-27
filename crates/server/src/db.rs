@@ -243,14 +243,16 @@ pub struct Event {
     pub id: i64,
     pub ts: String,
     pub level: String,
+    pub phase: Option<String>,
     pub message: String,
 }
 
-pub async fn add_event(pool: &SqlitePool, scan_id: &str, level: &str, message: &str) {
-    let res = sqlx::query("INSERT INTO scan_events (scan_id, ts, level, message) VALUES (?, ?, ?, ?)")
+pub async fn add_event(pool: &SqlitePool, scan_id: &str, level: &str, phase: Option<&str>, message: &str) {
+    let res = sqlx::query("INSERT INTO scan_events (scan_id, ts, level, phase, message) VALUES (?, ?, ?, ?, ?)")
         .bind(scan_id)
         .bind(Utc::now().to_rfc3339())
         .bind(level)
+        .bind(phase)
         .bind(message)
         .execute(pool)
         .await;
@@ -261,13 +263,13 @@ pub async fn add_event(pool: &SqlitePool, scan_id: &str, level: &str, message: &
 
 /// Events of a scan with id greater than `after`, oldest first.
 pub async fn get_events(pool: &SqlitePool, scan_id: &str, after: i64) -> Result<Vec<Event>> {
-    let rows = sqlx::query("SELECT id, ts, level, message FROM scan_events WHERE scan_id = ? AND id > ? ORDER BY id LIMIT 1000")
+    let rows = sqlx::query("SELECT id, ts, level, phase, message FROM scan_events WHERE scan_id = ? AND id > ? ORDER BY id LIMIT 1000")
         .bind(scan_id)
         .bind(after)
         .fetch_all(pool)
         .await?;
     Ok(rows
         .iter()
-        .map(|r| Event { id: r.get("id"), ts: r.get("ts"), level: r.get("level"), message: r.get("message") })
+        .map(|r| Event { id: r.get("id"), ts: r.get("ts"), level: r.get("level"), phase: r.get("phase"), message: r.get("message") })
         .collect())
 }
